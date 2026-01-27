@@ -12,7 +12,8 @@ Put them directly inside your testing directory, as a whole folder just as you d
 2-1. git clone https://github.com/crypto-starlab/THOR.git  
 2-2. pip install requirements.txt  
 2-3. Install Desilo Library
-- python setup.py Install
+- cd liberate
+- python setup.py install
 - pip install -e .
 - Download resources.tar.gz from the same Google Drive link above.
   Put it inside the following directory: liberate/src/liberate/fhe/cache/resources
