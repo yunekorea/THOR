@@ -1,2 +1,8 @@
-./keys
-./liberate/src/liberate/fhe/cache/resources/*uniform.pkl
+datasets/
+encoded_models_new/
+finetuned_models/
+keys/
+liberate/csprng/
+liberate/src/liberate/fhe/cache/resources/*uniform.pkl
+*.pyc
+*.so
