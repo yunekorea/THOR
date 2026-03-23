@@ -6,6 +6,8 @@ from liberate.fhe import ckks_engine
 from liberate.fhe.encdec import rotate
 from liberate.fhe.bootstrapping import ckks_bootstrapping as bs
 
+from pympler import asizeof
+
 print(ckks_engine)
 
 class CkksEngine(ckks_engine):
@@ -70,6 +72,32 @@ class CkksEngine(ckks_engine):
             with torch.cuda.device(device):
                 torch.cuda.empty_cache()
         temp = ct
+        total_size = asizeof.asizeof(temp)
+        
+        print("CKKS - Bootstrap function")
+        # Check specifically for the liberate-fhe DataStruct
+        if "liberate.fhe.data_struct.DataStruct" in str(type(ct)):
+            print("Detected liberate-fhe DataStruct. Probing internal attributes...")
+            
+            # DataStructs usually have a 'data' attribute or a dictionary of tensors
+            internal_bytes = 0
+            
+            # Inspect all attributes of the object
+            for attr_name in dir(ct):
+                if not attr_name.startswith('__'):
+                    attr_val = getattr(ct, attr_name)
+                    
+                    # If the attribute is a Tensor
+                    if torch.is_tensor(attr_val):
+                        internal_bytes += attr_val.element_size() * attr_val.nelement()
+                    
+                    # If the attribute is a list/tuple of Tensors (common for CKKS)
+                    elif isinstance(attr_val, (list, tuple)):
+                        internal_bytes += sum(t.element_size() * t.nelement() 
+                                            for t in attr_val if torch.is_tensor(t))
+            
+            print(f"DEBUG: DataStruct Internal Tensor Size: {internal_bytes / (1024**2):.2f} MB")
+
         ct_bs = bs.bootstrap(self, temp, self.bs_key, self.evk, self.conj_key, self.pk)
         for device in self.ntt.devices:
             with torch.cuda.device(device):
