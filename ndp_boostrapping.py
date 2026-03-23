@@ -27,7 +27,7 @@ def engine_init():
     engine = CkksEngine(params)
     return engine
 
-def key_init(engine):
+def key_init(engine, key_path):
     rotk_dict_keys = [
         -32768, -16384, -1024, -512, -32, -16,
         0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
@@ -36,22 +36,23 @@ def key_init(engine):
         7168, 8192, 9216, 10240, 11264, 12288, 13312, 14336,
         15360, 16384
     ]
-
-    pk = engine.load(f"./keys/keys0/pk")
+    pk = engine.load(f"{key_path}/pk")
     engine.add_pk(pk)
-    evk = engine.load(f"./keys/keys0/evk")
+    evk = engine.load(f"{key_path}/evk")
     engine.add_evk(evk)
-    conjk = engine.load(f"./keys/keys0/conjk")
+    conjk = engine.load(f"{key_path}/conjk")
     engine.add_conj_key(conjk)
     rotk_dict = {}
     for key in rotk_dict_keys:
-        rotk_dict[key] = engine.load(f"./keys/keys0/rotk_dict/{key}")
+        rotk_dict[key] = engine.load(f"{key_path}/rotk_dict/{key}")
     bs.create_cts_stc_const(engine)
     engine.add_bs_key(rotk_dict)
 
 def main():
+    #key_path = sys.argv[1]
+    key_path = "/mnt/nvmf/THOR_test/THOR/keys/keys0"
     engine = engine_init()
-    key_init(engine)
+    key_init(engine, key_path)
 
 if __name__ == '__main__':
     main()
