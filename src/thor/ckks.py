@@ -8,6 +8,9 @@ from liberate.fhe.bootstrapping import ckks_bootstrapping as bs
 
 from pympler import asizeof
 
+#For bootstrapping offloading to the NDP(Near-data Processing) platform
+import mmap
+
 print(ckks_engine)
 
 class CkksEngine(ckks_engine):
@@ -67,41 +70,44 @@ class CkksEngine(ckks_engine):
             pk = self.pk
         return super().encodecrypt(m, pk, level, padding)
     
+
     def bootstrap(self, ct):
         for device in self.ntt.devices:
             with torch.cuda.device(device):
                 torch.cuda.empty_cache()
         temp = ct
-        total_size = asizeof.asizeof(temp)
-        
+        total_payload_bytes = 0
+        for poly_list in ct.data:
+            for tensor in poly_list:
+                # element_size() is 8 bytes for int64/uint64
+                # nelement() is the total number of coefficients (N * L)
+                total_payload_bytes += tensor.nelement() * tensor.element_size()
+        header_size = 4096 
+        total_size = total_payload_bytes + header_size
         print("CKKS - Bootstrap function")
-        # Check specifically for the liberate-fhe DataStruct
-        if "liberate.fhe.data_struct.DataStruct" in str(type(ct)):
-            print("Detected liberate-fhe DataStruct. Probing internal attributes...")
-            
-            # DataStructs usually have a 'data' attribute or a dictionary of tensors
-            internal_bytes = 0
-            
-            # Inspect all attributes of the object
-            for attr_name in dir(ct):
-                if not attr_name.startswith('__'):
-                    attr_val = getattr(ct, attr_name)
-                    
-                    # If the attribute is a Tensor
-                    if torch.is_tensor(attr_val):
-                        internal_bytes += attr_val.element_size() * attr_val.nelement()
-                    
-                    # If the attribute is a list/tuple of Tensors (common for CKKS)
-                    elif isinstance(attr_val, (list, tuple)):
-                        internal_bytes += sum(t.element_size() * t.nelement() 
-                                            for t in attr_val if torch.is_tensor(t))
-            
-            print(f"DEBUG: DataStruct Internal Tensor Size: {internal_bytes / (1024**2):.2f} MB")
+        #print(f"Class Name: {ct.__class__.__name__}")
+        #print(f"Defined in module: {ct.__class__.__module__}")
+        #print(f"Tensor 0 Shape: {ct.data[0][0].shape}")
+        #print(f"Tensor 0 Dtype: {ct.data[0][0].dtype}")
+        #print(f"Total size: {total_size}")
+        #print(f"Type of CT: {ct}")
+        #print(f"Raw Data Pointer: {hex(ct.data.__array_interface__['data'][0]) if hasattr(ct.data, '__array_interface__') else 'N/A'}")
+        print(f"Total size(Before BS): {total_size}")
 
         ct_bs = bs.bootstrap(self, temp, self.bs_key, self.evk, self.conj_key, self.pk)
         for device in self.ntt.devices:
             with torch.cuda.device(device):
                 torch.cuda.empty_cache()
+        
+        total_payload_bytes = 0
+        for poly_list in ct.data:
+            for tensor in poly_list:
+                # element_size() is 8 bytes for int64/uint64
+                # nelement() is the total number of coefficients (N * L)
+                total_payload_bytes += tensor.nelement() * tensor.element_size()
+        total_size = total_payload_bytes + header_size
+        print(f"Total size(After BS): {total_size}")
+        
         return ct_bs
     
     #Mult
@@ -326,5 +332,45 @@ class CkksEngine(ckks_engine):
         else:
             raise errors.DifferentTypeError(a=a.origin, b=b.origin)
         return ct_add
+
+    #Methods for boostrapping offloading to NDP platform
+
+    def stage_ciphertext_to_dram(ct, mmap_buffer):
+        # 1. Extract and ensure contiguity
+        # We move to CPU and ensure the memory layout is packed
+        c0 = ct.data[0][0].detach().cpu().contiguous()
+        c1 = ct.data[1][0].detach().cpu().contiguous()
+        
+        # 2. Serialize Metadata into a simple byte header (4KB)
+        # We use a fixed-size header so the target knows the tensors start at offset 4096
+        header = bytearray(4096)
+        header[0] = int(ct.ntt_state)
+        header[1] = int(ct.include_special)
+        # Store levels as 4-byte integers
+        header[4:8] = ct.level_calc.to_bytes(4, 'little')
+        header[8:12] = ct.level_available.to_bytes(4, 'little')
+
+        # 3. Write to the mmap buffer
+        mmap_buffer.seek(0)
+        mmap_buffer.write(header)
+        mmap_buffer.write(c0.numpy().tobytes())
+        mmap_buffer.write(c1.numpy().tobytes())
+        
+        mmap_buffer.flush() 
+        return mmap_buffer
+
+    def ndp_bootstrap(self, ct):
+        for device in self.ntt.devices:
+            with torch.cuda.device(device):
+                torch.cuda.empty_cache()
+        temp = ct
+
+        ct_bs = bs.bootstrap(self, temp, self.bs_key, self.evk, self.conj_key, self.pk)
+        for device in self.ntt.devices:
+            with torch.cuda.device(device):
+                torch.cuda.empty_cache()
+        
+        return ct_bs
     
+
     
