@@ -9,7 +9,16 @@ from liberate.fhe.bootstrapping import ckks_bootstrapping as bs
 from pympler import asizeof
 
 #For bootstrapping offloading to the NDP(Near-data Processing) platform
+'''
 import mmap
+from libnvme import nvme
+import ctypes
+from ctypes.util import find_library
+from pyverbs.device import Context
+from pyverbs.pd import PD
+from pyverbs.mr import MR
+import pyverbs.enums as e
+'''
 
 print(ckks_engine)
 
@@ -76,6 +85,11 @@ class CkksEngine(ckks_engine):
             with torch.cuda.device(device):
                 torch.cuda.empty_cache()
         temp = ct
+        print("CKKS - Bootstrap function")
+        print(f"Class Name: {ct.__class__.__name__}")
+        print(f"Defined in module: {ct.__class__.__module__}")
+        print(f"Tensor 0 Shape: {ct.data[0][0].shape}")
+        print(f"Tensor 0 Dtype: {ct.data[0][0].dtype}")
         total_payload_bytes = 0
         for poly_list in ct.data:
             for tensor in poly_list:
@@ -84,12 +98,7 @@ class CkksEngine(ckks_engine):
                 total_payload_bytes += tensor.nelement() * tensor.element_size()
         header_size = 4096 
         total_size = total_payload_bytes + header_size
-        print("CKKS - Bootstrap function")
-        #print(f"Class Name: {ct.__class__.__name__}")
-        #print(f"Defined in module: {ct.__class__.__module__}")
-        #print(f"Tensor 0 Shape: {ct.data[0][0].shape}")
-        #print(f"Tensor 0 Dtype: {ct.data[0][0].dtype}")
-        #print(f"Total size: {total_size}")
+        print(f"Total size: {total_size}")
         #print(f"Type of CT: {ct}")
         #print(f"Raw Data Pointer: {hex(ct.data.__array_interface__['data'][0]) if hasattr(ct.data, '__array_interface__') else 'N/A'}")
         print(f"Total size(Before BS): {total_size}")
@@ -334,7 +343,7 @@ class CkksEngine(ckks_engine):
         return ct_add
 
     #Methods for boostrapping offloading to NDP platform
-
+'''
     def stage_ciphertext_to_dram(ct, mmap_buffer):
         # 1. Extract and ensure contiguity
         # We move to CPU and ensure the memory layout is packed
@@ -365,12 +374,19 @@ class CkksEngine(ckks_engine):
                 torch.cuda.empty_cache()
         temp = ct
 
-        ct_bs = bs.bootstrap(self, temp, self.bs_key, self.evk, self.conj_key, self.pk)
+        buffersize = 128 * 1024 * 1024
+        mmap_buffer = mmap.mmap(-1, buffersize, flags = mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+        mmap_buffer = self.stage_ciphertext_to_dram(temp, mmap_buffer)
+        #ct_bs = bs.bootstrap(self, temp, self.bs_key, self.evk, self.conj_key, self.pk)
+        
+        
+        
+        
         for device in self.ntt.devices:
             with torch.cuda.device(device):
                 torch.cuda.empty_cache()
         
-        return ct_bs
+        return temp
     
-
+'''
     
