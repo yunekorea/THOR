@@ -351,11 +351,7 @@ def get_weights(model_path):
 def run_job(job, model_path, light_plaintext_path, compact):
     job_type, layer_index = job
     weights = get_weights(model_path)
-
-    if compact:
-        engine = Engine(use_bootstrap_to_17_levels=True, compact=True)
-    else:
-        engine = Engine(use_bootstrap_to_14_levels=True, compact=False)
+    engine = Engine(use_bootstrap_to_14_levels=True, compact=compact)
 
     if job_type == "mask":
         pre_encode_masks(engine, light_plaintext_path)

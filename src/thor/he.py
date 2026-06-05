@@ -33,11 +33,7 @@ class HE:
         self.light_plaintext_path = get_light_plaintext_path(compact)
         self.mask_path = self.light_plaintext_path / "masks"
 
-        if compact:
-            self.engine = Engine(use_bootstrap_to_17_levels=True, mode="async gpu", device_id=device, compact=True)
-        else:
-            self.engine = Engine(use_bootstrap_to_14_levels=True, mode="async gpu", device_id=device, compact=False)
-
+        self.engine = Engine(use_bootstrap_to_14_levels=True, mode="async gpu", device_id=device, compact=compact)
         self.secret_key: SecretKey = self.engine.create_secret_key()
         self.conjugation_key: ConjugationKey = self.engine.create_conjugation_key(self.secret_key)
         self.relinearization_key: RelinearizationKey = self.engine.create_relinearization_key(self.secret_key)
@@ -48,11 +44,11 @@ class HE:
         )
 
         # fmt: off
-        if self.compact: # key size: medium, bootstrap depth: 17
+        if self.compact: # key size: medium
             self.bootstrap_deltas = set([
                 1, 2, 3, 4, 5, 6, 7, 8, 16, 24, 32, 64, 96, 128, 160, 192, 224, 256, 512, 768, 1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192, 16384, 24576, 31744, 32000, 32256, 32512, 32736, 32744, 32752, 32760  # noqa: E501
             ])
-        else:  # key size: large, bootstrap depth: 14
+        else:  # key size: large
             self.bootstrap_deltas = set([
                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448, 480, 512, 1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192, 9216, 10240, 11264, 12288, 13312, 14336, 15360, 16384, 31744, 32256, 32736, 32752  # noqa: E501
             ])
@@ -206,17 +202,12 @@ class HE:
         return np.real(decrypted)
 
     def bootstrap(self, ciphertext: Ciphertext) -> Ciphertext:
-        bootstrapped = self.engine.bootstrap(
+        return self.engine.bootstrap(
             ciphertext,
             self.relinearization_key,
             self.conjugation_key,
             self.bootstrap_key,
         )
-
-        if self.compact:
-            return self.level_down(bootstrapped, by=3)
-        else:
-            return bootstrapped
 
     def get_input_level(self, x):
         return min(x.flat[0].level_available, 14)
