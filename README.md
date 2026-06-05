@@ -111,8 +111,10 @@ Note that the original THOR paper reports 84.80% accuracy and 602 seconds comput
 
 | Mode | CPU | GPU | Compute Time |
 |---|---|---|---|
+| Default | Intel Xeon Platinum 8480+ | NVIDIA H100-HBM3-80GB | 436.1s |
 | Default | Intel Xeon Platinum 8462Y+ | NVIDIA A100-SXM4-80GB | 590.6s |
-| Compact | Intel Xeon Platinum 8462Y+ | NVIDIA A100-SXM4-80GB | 650.3s |
-| Compact | Intel Core i7-10700K @ 3.80GHz | NVIDIA GeForce RTX 5090 | 362.6s |
+| Compact | Intel Xeon Platinum 8480+ | NVIDIA H100-HBM3-80GB | 474.7s |
+| Compact | Intel Xeon Platinum 8462Y+ | NVIDIA A100-SXM4-80GB | 637.7s |
+| Compact | Intel Core i7-10700K @ 3.80GHz | NVIDIA GeForce RTX 5090 | 341.1s |
 
 For optimal performance, cache the encoded files for your selected mode with `vmtouch -t light_plaintexts/default/` or `vmtouch -t light_plaintexts/compact/` before running the forward pass.
