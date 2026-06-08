@@ -47,11 +47,14 @@ from thor.bert import ThorBert, ThorBertFF, ThorBertPooler, ThorBertClassifier
 sel = selectors.DefaultSelector()
 
 def engine_init():
+    print("engine init: ", end="")
     params = {"logN":16, "scale_bits": 41, "num_special_primes": 4, "quantum":"pre_quantum"}
     engine = CkksEngine(params)
+    print("DONE")
     return engine
 
 def key_init(engine, key_path):
+    print("key init:")
     rotk_dict_keys = [
         -32768, -16384, -1024, -512, -32, -16,
         0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
@@ -60,17 +63,25 @@ def key_init(engine, key_path):
         7168, 8192, 9216, 10240, 11264, 12288, 13312, 14336,
         15360, 16384
     ]
+    print("pk: ", end="")
     pk = engine.load(f"{key_path}/pk")
     engine.add_pk(pk)
+    print("DONE")
+    print("evk: ", end="")
     evk = engine.load(f"{key_path}/evk")
     engine.add_evk(evk)
+    print("DONE")
+    print("conjk: ", end="")
     conjk = engine.load(f"{key_path}/conjk")
     engine.add_conj_key(conjk)
+    print("DONE")
+    print("BS key: ", end="")
     rotk_dict = {}
     for key in rotk_dict_keys:
         rotk_dict[key] = engine.load(f"{key_path}/rotk_dict/{key}")
     bs.create_cts_stc_const(engine)
     engine.add_bs_key(rotk_dict)
+    print("DONE")
 
 def RDMA_init():
     dev_name = "mlx5_0".encode('utf-8')
@@ -89,13 +100,14 @@ def RDMA_init():
     return cid
 
 def UDS_init():
+    print("UDS init: ", end="")
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     if os.path.exists('/tmp/rdma_metadata.sock'):
         os.remove('/tmp/rdma_metadata.sock')
     server.bind('/tmp/rdma_metadata.sock')
     server.listen(1)
     server.setblocking(False)
-
+    print("DONE")
     return server
 
 def read_ciphertext(conn, mask, cid):
