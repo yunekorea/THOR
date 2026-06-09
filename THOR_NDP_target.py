@@ -46,6 +46,8 @@ import thor
 from thor import CkksEngine, ThorDataEncryptor, ThorLinearEvaluator
 from thor.bert import ThorBert, ThorBertFF, ThorBertPooler, ThorBertClassifier
 
+import time
+
 sel = selectors.DefaultSelector()
 
 def engine_init():
@@ -68,26 +70,6 @@ def key_init(engine, key_path):
     # Force an immediate clean start
     gc.collect()
     torch.cuda.empty_cache()
-    
-    print("pk: ", end="")
-    pk = engine.load(f"{key_path}/pk")
-    engine.add_pk(pk)
-    del pk
-    gc.collect()
-    print("DONE")
-    print("evk: ", end="")
-    evk = engine.load(f"{key_path}/evk")
-    engine.add_evk(evk)
-    del evk
-    gc.collect()
-    print("DONE")
-    print("conjk: ", end="")
-    conjk = engine.load(f"{key_path}/conjk")
-    engine.add_conj_key(conjk)
-    del conjk
-    gc.collect()
-    print("DONE")
-    print("ROTK dict: ", end="")
     rotk_dict = {}
     numkeys = len(rotk_dict_keys)
     loaded_stat = 0
@@ -105,6 +87,28 @@ def key_init(engine, key_path):
     del rotk_dict
     gc.collect()
     print("DONE")
+    
+    print("pk: ", end="")
+    pk = engine.load(f"{key_path}/pk")
+    engine.add_pk(pk)
+    del pk
+    gc.collect()
+    print("DONE")
+    print("evk: ", end="")
+    evk = engine.load(f"{key_path}/evk")
+    engine.add_evk(evk)
+    del evk
+    gc.collect()
+    print("DONE")
+    torch.cuda.empty_cache()
+    time.sleep(10)
+    print("conjk: ", end="")
+    conjk = engine.load(f"{key_path}/conjk")
+    engine.add_conj_key(conjk)
+    del conjk
+    gc.collect()
+    print("DONE")
+    print("ROTK dict: ", end="")
 
 def RDMA_init():
     dev_name = "mlx5_0".encode('utf-8')
