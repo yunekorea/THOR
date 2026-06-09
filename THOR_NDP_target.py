@@ -23,6 +23,7 @@ from pyverbs.librdmacm_enums import rdma_port_space, RAI_PASSIVE
 import pyverbs.wr as pwr
 
 import gc
+import collections
 
 
 project_root = os.path.abspath(os.path.join(os.getcwd(), './src'))
@@ -50,6 +51,57 @@ import time
 
 sel = selectors.DefaultSelector()
 
+class LazyGPUDict(collections.UserDict):
+    """
+    A custom dictionary that keeps heavy FHE keys on host memory (RAM)
+    and transparently moves them to the GPU only when accessed.
+    """
+    def __init__(self, key_path, keys_list, engine):
+        super().__init__()
+        self.key_path = key_path
+        self.engine = engine
+        
+        total = len(keys_list)
+        print("Pre-loading rotation keys to Host Memory (RAM)...")
+        for idx, k in enumerate(keys_list, start=1):
+            # 1. Load the tensor using the engine
+            loaded_tensor = self.engine.load(f"{self.key_path}/rotk_dict/{k}")
+            
+            # 2. IMMEDIATELY force the tensor back to host memory (CPU / RAM)
+            # This completely strips it from the RTX 3090's VRAM
+            if hasattr(loaded_tensor, "cpu"):
+                self.data[k] = loaded_tensor.cpu()
+            else:
+                # If it's a custom DataStruct containing PyTorch tensors inside attributes:
+                # We iterate through its internal structure to push tensors to CPU
+                for attr in dir(loaded_tensor):
+                    val = getattr(loaded_tensor, attr)
+                    if isinstance(val, torch.Tensor):
+                        setattr(loaded_tensor, attr, val.cpu())
+                self.data[k] = loaded_tensor
+            
+            # 3. Clean up the GPU footprint left during the load operation
+            del loaded_tensor
+            torch.cuda.empty_cache()
+            
+            if idx % 10 == 0 or idx == total:
+                print(f"  -> RAM Staged: {idx}/{total}")
+
+    def __getitem__(self, key):
+        # When the bootstrapping algorithm calls `rotk_dict[key]`:
+        # We intercept it and move ONLY this specific key back to the GPU
+        item = self.data[key]
+        
+        if hasattr(item, "cuda"):
+            return item.cuda()
+        else:
+            # If it's a complex structure, move its internal components to CUDA
+            for attr in dir(item):
+                val = getattr(item, attr)
+                if isinstance(val, torch.Tensor):
+                    setattr(item, attr, val.cuda())
+            return item
+
 def engine_init():
     print("engine init: ", end="")
     params = {"logN":16, "scale_bits": 41, "num_special_primes": 4, "quantum":"pre_quantum"}
@@ -70,6 +122,9 @@ def key_init(engine, key_path):
     # Force an immediate clean start
     gc.collect()
     torch.cuda.empty_cache()
+
+    lazy_rotk_dict = LazyGPUDict(key_path, rotk_dict_keys, engine)
+    '''
     rotk_dict = {}
     numkeys = len(rotk_dict_keys)
     loaded_stat = 0
@@ -81,8 +136,9 @@ def key_init(engine, key_path):
         torch.cuda.empty_cache()
         loaded_stat += 1
         print(f"loaded keys: {loaded_stat}/{numkeys}")
+    '''
     bs.create_cts_stc_const(engine)
-    engine.add_bs_key(rotk_dict)
+    engine.add_bs_key(lazy_rotk_dict)
 
     del rotk_dict
     gc.collect()
