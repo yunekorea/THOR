@@ -22,6 +22,8 @@ from pyverbs.libibverbs_enums import ibv_access_flags, ibv_qp_type, ibv_wr_opcod
 from pyverbs.librdmacm_enums import rdma_port_space, RAI_PASSIVE
 import pyverbs.wr as pwr
 
+import gc
+
 
 project_root = os.path.abspath(os.path.join(os.getcwd(), './src'))
 if project_root not in sys.path:
@@ -63,24 +65,45 @@ def key_init(engine, key_path):
         7168, 8192, 9216, 10240, 11264, 12288, 13312, 14336,
         15360, 16384
     ]
+    # Force an immediate clean start
+    gc.collect()
+    torch.cuda.empty_cache()
+    
     print("pk: ", end="")
     pk = engine.load(f"{key_path}/pk")
     engine.add_pk(pk)
+    del pk
+    gc.collect()
     print("DONE")
     print("evk: ", end="")
     evk = engine.load(f"{key_path}/evk")
     engine.add_evk(evk)
+    del evk
+    gc.collect()
     print("DONE")
     print("conjk: ", end="")
     conjk = engine.load(f"{key_path}/conjk")
     engine.add_conj_key(conjk)
+    del conjk
+    gc.collect()
     print("DONE")
-    print("BS key: ", end="")
+    print("ROTK dict: ", end="")
     rotk_dict = {}
+    numkeys = len(rotk_dict_keys)
+    loaded_stat = 0
     for key in rotk_dict_keys:
-        rotk_dict[key] = engine.load(f"{key_path}/rotk_dict/{key}")
+        loaded_dict_key = engine.load(f"{key_path}/rotk_dict/{key}")
+        rotk_dict[key] = loaded_dict_key
+        del loaded_dict_key
+        gc.collect()
+        torch.cuda.empty_cache()
+        loaded_stat += 1
+        print(f"loaded keys: {loaded_stat}/{numkeys}")
     bs.create_cts_stc_const(engine)
     engine.add_bs_key(rotk_dict)
+
+    del rotk_dict
+    gc.collect()
     print("DONE")
 
 def RDMA_init():
