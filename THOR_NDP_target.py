@@ -120,10 +120,17 @@ def RDMA_init():
     # Initialize CIMD
     host_ip = "192.168.100.2"
     target_ip = "192.168.100.1"
-    cai = AddrInfo(src = target_ip,dst=host_ip, dst_service="9999",
-                    port_space = rdma_port_space.RDMA_PS_TCP)
+    #cai = AddrInfo(src = target_ip,dst=host_ip, dst_service="9999",
+    #                port_space = rdma_port_space.RDMA_PS_TCP)
+
+    cai = AddrInfo(src=target_ip, src_service="9999",
+                port_space = rdma_port_space.RDMA_PS_TCP, flags = RAI_PASSIVE)
     cid = CMID(creator=cai, qp_init_attr=qp_init_attr)
-    return cid
+    print("cid listen")
+    cid.listen()
+    new_id = cid.get_request()
+    new_id.accept()
+    return new_id
 
 def UDS_init():
     print("UDS init: ", end="")
@@ -163,7 +170,7 @@ def read_ciphertext(conn, mask, cid):
             
             # Now you can proceed with your RDMA logic using these variables
             print("cid.connect() start")
-            cid.connect()
+            #cid.connect()
         
             local_mr = cid.reg_msgs(length)
             print("MR set")
@@ -202,11 +209,10 @@ def main():
     key_path = "/mnt/nvmf/THOR_test/THOR/keys/keys0"
     engine = engine_init()
     key_init(engine, key_path)
-    cid = RDMA_init()
     server = UDS_init()
     sel.register(server, selectors.EVENT_READ,
                  data=lambda key_obj, mask_val: accept_connection(key_obj.fileobj, mask_val, cid))
-
+    cid = RDMA_init()
     print("Python is ready. Waiting for asynchronous events...")
     try:
         while True:
