@@ -311,7 +311,7 @@ def ct_serialization(ct: DataStruct, cmid):
           f"{total_tensor_bytes}B tensor payload = {total_mr_size}B total")
 
     # ── 4. Allocate RDMA MR ───────────────────────────────────────────────────
-    mr         = cmid.reg_msgs(total_mr_size)
+    mr         = cmid.reg_read(total_mr_size)
     mr_pointer = mr.buf
     print(f"[Step 2] MR allocated at host address: {hex(mr_pointer)}")
 
@@ -429,6 +429,10 @@ def nvme_passthru(mr, fd):
         "devnamelen": dev_name_len,
         "devname": dev_name
     }
+    print(f"rkey: {hex(mr.rkey)}")
+    print(f"addr: {hex(mr.buf)}")
+    print(f"length:{mr.length}")
+
 
     cmd = nvme.ndp_passthru_cmd()
     cmd.opcode = 0xdb

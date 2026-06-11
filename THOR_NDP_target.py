@@ -285,7 +285,6 @@ def ct_deserialization(mr, total_mr_size: int, device=None) -> DataStruct:
     mr_pointer = mr.buf
 
     # ── 1. Validate magic ─────────────────────────────────────────────────────
-    print(f"Data from Host: {mr.read(32, 0).decode()}")
     magic_arr = (ctypes.c_uint8 * len(_MAGIC)).from_address(mr_pointer)
     if bytes(magic_arr) != _MAGIC:
         raise ValueError(f"MR magic mismatch — data may be corrupt or incompatible.")
@@ -498,6 +497,8 @@ def read_ciphertext(conn, mask, cid, engine):
             if wc is None:
                 raise RuntimeError("No send completion returned")
             print("Successful")
+            local_mr.close()
+            new_mr.close()
 
 
         
