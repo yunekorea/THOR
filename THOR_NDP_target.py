@@ -477,13 +477,19 @@ def read_ciphertext(conn, mask, cid, engine):
             local_mr = cid.reg_msgs(length)
             print("MR set")
             cid.post_read(local_mr, length, addr, rkey)
+            wc = cid.get_send_comp()
+            if wc is None:
+                raise RuntimeError("No READ completion returned")
 
             ct = ct_deserialization(local_mr, length)
             res_ct = engine.bootstrap(ct)
-            new_mr = ct_serialization(res_ct, cid)
+            new_mr , new_size = ct_serialization(res_ct, cid)
 
             print("Post SEND")
-            cid.post_send(new_mr, length)
+            cid.post_send(new_mr, new_size)
+            wc = cid.get_send_comp()
+            if wc is None:
+                raise RuntimeError("No send completion returned")
             print("Successful")
 
 
@@ -509,16 +515,16 @@ def main():
     engine = engine_init()
     key_init(engine, key_path)
     server = UDS_init()
+    cid = RDMA_init()
     sel.register(server, selectors.EVENT_READ,
                  data=lambda key_obj, mask_val: accept_connection(key_obj.fileobj, mask_val, cid, engine))
-    cid = RDMA_init()
     print("Python is ready. Waiting for asynchronous events...")
     try:
         while True:
             events = sel.select() # This blocks efficiently (uses epoll/kqueue)
             for key, mask in events:
                 callback = key.data
-                callback(key.fileobj, mask)
+                callback(key, mask)
     except KeyboardInterrupt:
         print("Shutting down...")
 

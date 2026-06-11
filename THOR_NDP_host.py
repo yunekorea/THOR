@@ -473,6 +473,9 @@ def nvme_passthru(mr, fd):
 def receive_bs_result(cmid, size):
     rmr = cmid.reg_msgs(size)
     cmid.post_recv(rmr)
+    wc = cmid.get_recv_comp()
+    if wc is None:
+        raise RuntimeError("No recv completion returned")
 
     return rmr
 
