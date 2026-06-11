@@ -104,6 +104,10 @@ class CkksEngine(ckks_engine):
         print(f"Total size(Before BS): {total_size}")
 
         ct_bs = bs.bootstrap(self, temp, self.bs_key, self.evk, self.conj_key, self.pk)
+
+        if hasattr(self.bs_key, 'cache_stats'):
+            print(f"BS key cache stats: {self.bs_key.cache_stats}")
+            print(f"GPU-resident keys:  {self.bs_key.gpu_resident_keys}")
         for device in self.ntt.devices:
             with torch.cuda.device(device):
                 torch.cuda.empty_cache()
