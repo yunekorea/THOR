@@ -475,20 +475,27 @@ def nvme_passthru(mr, fd):
     return result
 
 def receive_bs_result(cmid, size):
-    rmr = cmid.reg_msgs(size)
+    #rmr = cmid.reg_msgs(size)
+    rmr = cmid.reg_msgs(52428800)
     cmid.post_recv(rmr)
     wc = cmid.get_recv_comp()
     if wc is None:
         raise RuntimeError("No recv completion returned")
+    print(
+                f"RECV completion: status={wc.status} "
+                f"opcode={wc.opcode} "
+                f"bytes={wc.byte_len}"
+            )
 
-    return rmr
+    length = 52428800
+    return rmr, length
 
 
 def bs_offload(ct, cmid):
     mr, ct_size = ct_serialization(ct, cmid)
     result = nvme_passthru(mr, fd)
-    rmr = receive_bs_result(cmid, ct_size)
-    result_ct = ct_deserialization(rmr, ct_size)
+    rmr, new_ct_size = receive_bs_result(cmid, ct_size)
+    result_ct = ct_deserialization(rmr, new_ct_size)
 
     return result_ct
 
