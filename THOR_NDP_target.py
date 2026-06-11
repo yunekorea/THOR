@@ -43,6 +43,7 @@ from transformers import BertForNextSentencePrediction
 import matplotlib.pyplot as plt
 
 from liberate.fhe.bootstrapping import ckks_bootstrapping as bs
+from liberate.fhe.data_struct import DataStruct
 
 import thor
 from thor import CkksEngine, ThorDataEncryptor, ThorLinearEvaluator
@@ -190,62 +191,43 @@ _ALIGN  = 64   # align tensor data to 64-byte boundary (cache-line friendly)
 def _align_up(n: int, align: int) -> int:
     return int(math.ceil(n / align) * align)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Serialization
-# ──────────────────────────────────────────────────────────────────────────────
-
 def ct_serialization(ct: DataStruct, cmid):
-    """
-    Serialize a DataStruct (HE ciphertext) directly into an RDMA MR.
-
-    MR layout
-    ---------
-    [8]  magic
-    [8]  header_json byte-length  (uint64 little-endian)
-    [8]  tensor_meta_json byte-length (uint64 little-endian)
-    [N]  header JSON  (utf-8)
-    [M]  tensor-meta JSON (utf-8)
-    [P]  zero-padding to _ALIGN boundary
-    [...]  tensor 0 raw bytes
-    [...]  tensor 1 raw bytes
-    ...
-
-    All tensors must already be on the GPU.
-    """
-
-    # ── 1. Build header JSON (scalar metadata) ────────────────────────────────
+    # ── 1. Build header JSON ──────────────────────────────────────────────────
     header = {
-        "include_special":   ct.include_special,
-        "ntt_state":         ct.ntt_state,
-        "montgomery_state":  ct.montgomery_state,
-        "origin":            ct.origin,
-        "level_calc":        ct.level_calc,
-        "level_available":   ct.level_available,
-        "hash":              ct.hash,
-        "version":           ct.version,
+        "include_special":  ct.include_special,
+        "ntt_state":        ct.ntt_state,
+        "montgomery_state": ct.montgomery_state,
+        "origin":           ct.origin,
+        "level_calc":       ct.level_calc,
+        "level_available":  ct.level_available,
+        "hash":             ct.hash,
+        "version":          ct.version,
     }
     header_bytes = json.dumps(header).encode("utf-8")
 
-    # ── 2. Build tensor-meta JSON (shape / dtype / byte-size per tensor) ──────
+    # ── 2. Build tensor-meta JSON (nested list mirrors ct.data structure) ─────
     tensor_meta = []
     total_tensor_bytes = 0
-    for i, tensor in enumerate(ct.data):
-        if not tensor.is_cuda:
-            raise ValueError(f"Tensor {i} must be on the GPU before serialization.")
-        nbytes = tensor.nelement() * tensor.element_size()
-        tensor_meta.append({
-            "shape":  list(tensor.shape),
-            "dtype":  str(tensor.dtype).replace("torch.", ""),  # e.g. "int64"
-            "nbytes": nbytes,
-        })
-        total_tensor_bytes += nbytes
+    for i, poly_list in enumerate(ct.data):
+        poly_meta = []
+        for j, tensor in enumerate(poly_list):
+            if not tensor.is_cuda:
+                raise ValueError(f"Tensor [{i}][{j}] must be on the GPU before serialization.")
+            nbytes = tensor.nelement() * tensor.element_size()
+            poly_meta.append({
+                "shape":  list(tensor.shape),
+                "dtype":  str(tensor.dtype).replace("torch.", ""),
+                "nbytes": nbytes,
+            })
+            total_tensor_bytes += nbytes
+        tensor_meta.append(poly_meta)
     tensor_meta_bytes = json.dumps(tensor_meta).encode("utf-8")
 
     # ── 3. Calculate total MR size ────────────────────────────────────────────
     preamble_size = (
         len(_MAGIC)
-        + 8                          # header_json_len
-        + 8                          # tensor_meta_json_len
+        + 8                           # header_json_len
+        + 8                           # tensor_meta_json_len
         + len(header_bytes)
         + len(tensor_meta_bytes)
     )
@@ -261,7 +243,7 @@ def ct_serialization(ct: DataStruct, cmid):
     mr_pointer = mr.buf
     print(f"[Step 2] MR allocated at host address: {hex(mr_pointer)}")
 
-    # ── 5. Write preamble directly into MR memory ────────────────────────────
+    # ── 5. Write preamble into MR ─────────────────────────────────────────────
     preamble = (
         _MAGIC
         + struct.pack("<Q", len(header_bytes))
@@ -273,20 +255,21 @@ def ct_serialization(ct: DataStruct, cmid):
     preamble_arr[:] = preamble
     print(f"[Step 3] Preamble written ({len(preamble)}B)")
 
-    # ── 6. DMA each GPU tensor into the aligned MR region ────────────────────
+    # ── 6. Copy tensors GPU → MR ──────────────────────────────────────────────
     current_offset = tensor_data_offset
-    for i, (tensor, meta) in enumerate(zip(ct.data, tensor_meta)):
-        nbytes       = meta["nbytes"]
-        chunk_addr   = mr_pointer + current_offset
-        ctypes_arr   = (ctypes.c_uint8 * nbytes).from_address(chunk_addr)
-        host_view    = (torch.frombuffer(ctypes_arr, dtype=torch.uint8)
-                            .view(tensor.dtype)
-                            .view(tensor.shape))
-        host_view.copy_(tensor, non_blocking=True)
-        current_offset += nbytes
+    for poly_list, poly_meta in zip(ct.data, tensor_meta):
+        for tensor, meta in zip(poly_list, poly_meta):
+            nbytes     = meta["nbytes"]
+            chunk_addr = mr_pointer + current_offset
+            ctypes_arr = (ctypes.c_uint8 * nbytes).from_address(chunk_addr)
+            host_view  = (torch.frombuffer(ctypes_arr, dtype=torch.uint8)
+                              .view(tensor.dtype)
+                              .view(tensor.shape))
+            host_view.copy_(tensor, non_blocking=True)
+            current_offset += nbytes
 
     torch.cuda.synchronize()
-    print(f"[Step 4] {len(ct.data)} tensor(s) copied GPU → MR (non-blocking + sync).")
+    print(f"[Step 4] Tensors copied GPU → MR.")
 
     return mr, total_mr_size
 
@@ -296,19 +279,6 @@ def ct_serialization(ct: DataStruct, cmid):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def ct_deserialization(mr, total_mr_size: int, device=None) -> DataStruct:
-    """
-    Reconstruct a DataStruct from an RDMA MR produced by ct_serialization().
-
-    Parameters
-    ----------
-    mr            : pyverbs MR object (must still be registered / mapped)
-    total_mr_size : value returned by ct_serialization()
-    device        : torch device to place tensors on (default: cuda:0)
-
-    Returns
-    -------
-    DataStruct with all tensors on `device`
-    """
     if device is None:
         device = torch.device("cuda", 0)
 
@@ -316,59 +286,54 @@ def ct_deserialization(mr, total_mr_size: int, device=None) -> DataStruct:
 
     # ── 1. Validate magic ─────────────────────────────────────────────────────
     magic_arr = (ctypes.c_uint8 * len(_MAGIC)).from_address(mr_pointer)
-    magic     = bytes(magic_arr)
-    if magic != _MAGIC:
-        raise ValueError(
-            f"MR magic mismatch: expected {_MAGIC!r}, got {magic!r}. "
-            "Data may be corrupt or from an incompatible version."
-        )
+    if bytes(magic_arr) != _MAGIC:
+        raise ValueError(f"MR magic mismatch — data may be corrupt or incompatible.")
     pos = len(_MAGIC)
 
     # ── 2. Read JSON length fields ────────────────────────────────────────────
-    header_len_arr      = (ctypes.c_uint8 * 8).from_address(mr_pointer + pos)
-    header_json_len     = struct.unpack("<Q", bytes(header_len_arr))[0]
+    header_json_len      = struct.unpack("<Q", bytes((ctypes.c_uint8 * 8).from_address(mr_pointer + pos)))[0]
     pos += 8
-
-    tmeta_len_arr       = (ctypes.c_uint8 * 8).from_address(mr_pointer + pos)
-    tensor_meta_json_len = struct.unpack("<Q", bytes(tmeta_len_arr))[0]
+    tensor_meta_json_len = struct.unpack("<Q", bytes((ctypes.c_uint8 * 8).from_address(mr_pointer + pos)))[0]
     pos += 8
 
     # ── 3. Parse header JSON ──────────────────────────────────────────────────
-    header_arr  = (ctypes.c_uint8 * header_json_len).from_address(mr_pointer + pos)
-    header      = json.loads(bytes(header_arr).decode("utf-8"))
+    header = json.loads(bytes((ctypes.c_uint8 * header_json_len).from_address(mr_pointer + pos)).decode("utf-8"))
     pos += header_json_len
 
     # ── 4. Parse tensor-meta JSON ─────────────────────────────────────────────
-    tmeta_arr   = (ctypes.c_uint8 * tensor_meta_json_len).from_address(mr_pointer + pos)
-    tensor_meta = json.loads(bytes(tmeta_arr).decode("utf-8"))
+    tensor_meta = json.loads(bytes((ctypes.c_uint8 * tensor_meta_json_len).from_address(mr_pointer + pos)).decode("utf-8"))
     pos += tensor_meta_json_len
 
     # ── 5. Skip alignment padding ─────────────────────────────────────────────
     tensor_data_offset = _align_up(pos, _ALIGN)
 
-    # ── 6. Reconstruct tensors (MR → CPU view → GPU) ─────────────────────────
-    tensors       = []
+    # ── 6. Reconstruct nested tensor list (MR → CPU → GPU) ───────────────────
+    data = []
     current_offset = tensor_data_offset
-    for meta in tensor_meta:
-        nbytes     = meta["nbytes"]
-        shape      = meta["shape"]
-        dtype      = getattr(torch, meta["dtype"])          # "int64" → torch.int64
-        chunk_addr = mr_pointer + current_offset
+    for poly_meta in tensor_meta:
+        poly_list = []
+        for meta in poly_meta:
+            nbytes     = meta["nbytes"]
+            shape      = meta["shape"]
+            dtype      = getattr(torch, meta["dtype"])
+            chunk_addr = mr_pointer + current_offset
 
-        ctypes_arr = (ctypes.c_uint8 * nbytes).from_address(chunk_addr)
-        cpu_tensor = (torch.frombuffer(ctypes_arr, dtype=torch.uint8)
-                          .view(dtype)
-                          .view(shape)
-                          .clone())                         # owns its memory
-        tensors.append(cpu_tensor.to(device=device, non_blocking=True))
-        current_offset += nbytes
+            ctypes_arr = (ctypes.c_uint8 * nbytes).from_address(chunk_addr)
+            cpu_tensor = (torch.frombuffer(ctypes_arr, dtype=torch.uint8)
+                              .view(dtype)
+                              .view(shape)
+                              .clone())                     # detach from MR memory
+            poly_list.append(cpu_tensor.to(device=device, non_blocking=True))
+            current_offset += nbytes
+        data.append(poly_list)
 
     torch.cuda.synchronize()
-    print(f"[Deserialize] {len(tensors)} tensor(s) loaded onto {device}.")
+    print(f"[Deserialize] {sum(len(p) for p in data)} tensor(s) across "
+          f"{len(data)} poly_list(s) loaded onto {device}.")
 
     # ── 7. Rebuild DataStruct ─────────────────────────────────────────────────
     ct = DataStruct(
-        data             = tensors,
+        data             = data,
         include_special  = header["include_special"],
         ntt_state        = header["ntt_state"],
         montgomery_state = header["montgomery_state"],
