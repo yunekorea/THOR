@@ -5,6 +5,7 @@ import os
 import pprint
 import mmap
 import struct
+import json
 
 import ctypes
 from ctypes.util import find_library
@@ -51,6 +52,338 @@ import time
 
 sel = selectors.DefaultSelector()
 
+from collections import OrderedDict
+
+
+class LRUBootstrapKeyCache:
+    """
+    Transparent dict-like wrapper for the bs_key (rotk_dict) that keeps at
+    most `max_gpu_keys` rotation keys on the GPU at once.
+
+    All 55 keys are permanently stored on the CPU in `_host`.
+    The GPU cache (`_gpu`) is bounded by `max_gpu_keys` and managed with LRU.
+
+    When bs.bootstrap() does  bs_key[k]:
+      - Hit  : return the GPU tensor, mark as MRU.
+      - Miss : evict the LRU key if full (just delete it — CPU copy is
+               already safe in _host), then upload the needed key to GPU.
+    """
+
+    def __init__(self, engine, host_store: dict, max_gpu_keys: int = 4):
+        """
+        Parameters
+        ----------
+        engine        : CKKS engine  (provides .cuda() and .cpu())
+        host_store    : {rotation_key: DataStruct on CPU}  — owns the data
+        max_gpu_keys  : GPU cache capacity (tune to fit your VRAM budget)
+        """
+        self._engine = engine
+        self._host   = host_store     # permanent CPU store, never mutated
+        self._gpu    = OrderedDict()  # {key: DataStruct on GPU}, LRU order
+        self._max    = max_gpu_keys
+
+        # Stats for debugging
+        self._hits   = 0
+        self._misses = 0
+
+    # ------------------------------------------------------------------
+    # Primary interface — bs.bootstrap() calls this as  bs_key[k]
+    # ------------------------------------------------------------------
+    def __getitem__(self, key):
+        if key in self._gpu:
+            self._gpu.move_to_end(key)   # promote to MRU
+            self._hits += 1
+            return self._gpu[key]
+
+        # Cache miss
+        self._misses += 1
+
+        if key not in self._host:
+            raise KeyError(
+                f"Bootstrap rotation key {key!r} was never loaded. "
+                f"Available keys: {list(self._host.keys())}"
+            )
+
+        # Evict LRU entry if at capacity
+        if len(self._gpu) >= self._max:
+            self._evict_lru()
+
+        # Upload CPU → GPU and cache it
+        gpu_ds = self._engine.cuda(self._host[key])
+        self._gpu[key] = gpu_ds
+        self._gpu.move_to_end(key)       # mark as MRU
+        return gpu_ds
+
+    # ------------------------------------------------------------------
+    # Membership / iteration — use CPU store so no GPU side-effects
+    # ------------------------------------------------------------------
+    def __contains__(self, key):
+        return key in self._host
+
+    def __len__(self):
+        return len(self._host)
+
+    def keys(self):
+        return self._host.keys()
+
+    # Prevent accidental full-cache GPU upload
+    def values(self):
+        raise NotImplementedError(
+            "Iterating .values() would upload all 55 keys to GPU. "
+            "Access individual keys via bs_key[k] instead."
+        )
+
+    def items(self):
+        raise NotImplementedError(
+            "Iterating .items() would upload all 55 keys to GPU. "
+            "Access individual keys via bs_key[k] instead."
+        )
+
+    # ------------------------------------------------------------------
+    # LRU eviction
+    # ------------------------------------------------------------------
+    def _evict_lru(self):
+        """
+        Drop the least-recently-used GPU DataStruct.
+        The CPU copy in self._host is untouched — it was loaded from disk
+        with move_to_gpu=False and never moved, so nothing needs writing back.
+        """
+        lru_key, lru_ds = self._gpu.popitem(last=False)  # last=False → LRU end
+        del lru_ds
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def evict_all(self):
+        """Flush the entire GPU cache. Call this after bootstrapping is done."""
+        keys = list(self._gpu.keys())
+        for k in keys:
+            del self._gpu[k]
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    # ------------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------------
+    @property
+    def gpu_resident_keys(self) -> list:
+        """Keys currently on the GPU, in LRU → MRU order."""
+        return list(self._gpu.keys())
+
+    @property
+    def cache_stats(self) -> dict:
+        total = self._hits + self._misses
+        hit_rate = self._hits / total if total else 0.0
+        return {
+            "gpu_resident":  len(self._gpu),
+            "max_gpu":       self._max,
+            "total_keys":    len(self._host),
+            "hits":          self._hits,
+            "misses":        self._misses,
+            "hit_rate":      f"{hit_rate:.1%}",
+        }
+
+# Magic bytes to catch corruption / version mismatch
+_MAGIC = b"LBFHE001"
+_ALIGN  = 64   # align tensor data to 64-byte boundary (cache-line friendly)
+
+
+def _align_up(n: int, align: int) -> int:
+    return int(math.ceil(n / align) * align)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Serialization
+# ──────────────────────────────────────────────────────────────────────────────
+
+def ct_serialization(ct: DataStruct, cmid):
+    """
+    Serialize a DataStruct (HE ciphertext) directly into an RDMA MR.
+
+    MR layout
+    ---------
+    [8]  magic
+    [8]  header_json byte-length  (uint64 little-endian)
+    [8]  tensor_meta_json byte-length (uint64 little-endian)
+    [N]  header JSON  (utf-8)
+    [M]  tensor-meta JSON (utf-8)
+    [P]  zero-padding to _ALIGN boundary
+    [...]  tensor 0 raw bytes
+    [...]  tensor 1 raw bytes
+    ...
+
+    All tensors must already be on the GPU.
+    """
+
+    # ── 1. Build header JSON (scalar metadata) ────────────────────────────────
+    header = {
+        "include_special":   ct.include_special,
+        "ntt_state":         ct.ntt_state,
+        "montgomery_state":  ct.montgomery_state,
+        "origin":            ct.origin,
+        "level_calc":        ct.level_calc,
+        "level_available":   ct.level_available,
+        "hash":              ct.hash,
+        "version":           ct.version,
+    }
+    header_bytes = json.dumps(header).encode("utf-8")
+
+    # ── 2. Build tensor-meta JSON (shape / dtype / byte-size per tensor) ──────
+    tensor_meta = []
+    total_tensor_bytes = 0
+    for i, tensor in enumerate(ct.data):
+        if not tensor.is_cuda:
+            raise ValueError(f"Tensor {i} must be on the GPU before serialization.")
+        nbytes = tensor.nelement() * tensor.element_size()
+        tensor_meta.append({
+            "shape":  list(tensor.shape),
+            "dtype":  str(tensor.dtype).replace("torch.", ""),  # e.g. "int64"
+            "nbytes": nbytes,
+        })
+        total_tensor_bytes += nbytes
+    tensor_meta_bytes = json.dumps(tensor_meta).encode("utf-8")
+
+    # ── 3. Calculate total MR size ────────────────────────────────────────────
+    preamble_size = (
+        len(_MAGIC)
+        + 8                          # header_json_len
+        + 8                          # tensor_meta_json_len
+        + len(header_bytes)
+        + len(tensor_meta_bytes)
+    )
+    tensor_data_offset = _align_up(preamble_size, _ALIGN)
+    total_mr_size      = tensor_data_offset + total_tensor_bytes
+
+    print(f"[Step 1] MR layout: {preamble_size}B preamble + "
+          f"{tensor_data_offset - preamble_size}B padding + "
+          f"{total_tensor_bytes}B tensor payload = {total_mr_size}B total")
+
+    # ── 4. Allocate RDMA MR ───────────────────────────────────────────────────
+    mr         = cmid.reg_msgs(total_mr_size)
+    mr_pointer = mr.buf
+    print(f"[Step 2] MR allocated at host address: {hex(mr_pointer)}")
+
+    # ── 5. Write preamble directly into MR memory ────────────────────────────
+    preamble = (
+        _MAGIC
+        + struct.pack("<Q", len(header_bytes))
+        + struct.pack("<Q", len(tensor_meta_bytes))
+        + header_bytes
+        + tensor_meta_bytes
+    )
+    preamble_arr = (ctypes.c_uint8 * len(preamble)).from_address(mr_pointer)
+    preamble_arr[:] = preamble
+    print(f"[Step 3] Preamble written ({len(preamble)}B)")
+
+    # ── 6. DMA each GPU tensor into the aligned MR region ────────────────────
+    current_offset = tensor_data_offset
+    for i, (tensor, meta) in enumerate(zip(ct.data, tensor_meta)):
+        nbytes       = meta["nbytes"]
+        chunk_addr   = mr_pointer + current_offset
+        ctypes_arr   = (ctypes.c_uint8 * nbytes).from_address(chunk_addr)
+        host_view    = (torch.frombuffer(ctypes_arr, dtype=torch.uint8)
+                            .view(tensor.dtype)
+                            .view(tensor.shape))
+        host_view.copy_(tensor, non_blocking=True)
+        current_offset += nbytes
+
+    torch.cuda.synchronize()
+    print(f"[Step 4] {len(ct.data)} tensor(s) copied GPU → MR (non-blocking + sync).")
+
+    return mr, total_mr_size
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Deserialization
+# ──────────────────────────────────────────────────────────────────────────────
+
+def ct_deserialization(mr, total_mr_size: int, device=None) -> DataStruct:
+    """
+    Reconstruct a DataStruct from an RDMA MR produced by ct_serialization().
+
+    Parameters
+    ----------
+    mr            : pyverbs MR object (must still be registered / mapped)
+    total_mr_size : value returned by ct_serialization()
+    device        : torch device to place tensors on (default: cuda:0)
+
+    Returns
+    -------
+    DataStruct with all tensors on `device`
+    """
+    if device is None:
+        device = torch.device("cuda", 0)
+
+    mr_pointer = mr.buf
+
+    # ── 1. Validate magic ─────────────────────────────────────────────────────
+    magic_arr = (ctypes.c_uint8 * len(_MAGIC)).from_address(mr_pointer)
+    magic     = bytes(magic_arr)
+    if magic != _MAGIC:
+        raise ValueError(
+            f"MR magic mismatch: expected {_MAGIC!r}, got {magic!r}. "
+            "Data may be corrupt or from an incompatible version."
+        )
+    pos = len(_MAGIC)
+
+    # ── 2. Read JSON length fields ────────────────────────────────────────────
+    header_len_arr      = (ctypes.c_uint8 * 8).from_address(mr_pointer + pos)
+    header_json_len     = struct.unpack("<Q", bytes(header_len_arr))[0]
+    pos += 8
+
+    tmeta_len_arr       = (ctypes.c_uint8 * 8).from_address(mr_pointer + pos)
+    tensor_meta_json_len = struct.unpack("<Q", bytes(tmeta_len_arr))[0]
+    pos += 8
+
+    # ── 3. Parse header JSON ──────────────────────────────────────────────────
+    header_arr  = (ctypes.c_uint8 * header_json_len).from_address(mr_pointer + pos)
+    header      = json.loads(bytes(header_arr).decode("utf-8"))
+    pos += header_json_len
+
+    # ── 4. Parse tensor-meta JSON ─────────────────────────────────────────────
+    tmeta_arr   = (ctypes.c_uint8 * tensor_meta_json_len).from_address(mr_pointer + pos)
+    tensor_meta = json.loads(bytes(tmeta_arr).decode("utf-8"))
+    pos += tensor_meta_json_len
+
+    # ── 5. Skip alignment padding ─────────────────────────────────────────────
+    tensor_data_offset = _align_up(pos, _ALIGN)
+
+    # ── 6. Reconstruct tensors (MR → CPU view → GPU) ─────────────────────────
+    tensors       = []
+    current_offset = tensor_data_offset
+    for meta in tensor_meta:
+        nbytes     = meta["nbytes"]
+        shape      = meta["shape"]
+        dtype      = getattr(torch, meta["dtype"])          # "int64" → torch.int64
+        chunk_addr = mr_pointer + current_offset
+
+        ctypes_arr = (ctypes.c_uint8 * nbytes).from_address(chunk_addr)
+        cpu_tensor = (torch.frombuffer(ctypes_arr, dtype=torch.uint8)
+                          .view(dtype)
+                          .view(shape)
+                          .clone())                         # owns its memory
+        tensors.append(cpu_tensor.to(device=device, non_blocking=True))
+        current_offset += nbytes
+
+    torch.cuda.synchronize()
+    print(f"[Deserialize] {len(tensors)} tensor(s) loaded onto {device}.")
+
+    # ── 7. Rebuild DataStruct ─────────────────────────────────────────────────
+    ct = DataStruct(
+        data             = tensors,
+        include_special  = header["include_special"],
+        ntt_state        = header["ntt_state"],
+        montgomery_state = header["montgomery_state"],
+        origin           = header["origin"],
+        level_calc       = header["level_calc"],
+        level_available  = header["level_available"],
+        hash             = header["hash"],
+        version          = header["version"],
+    )
+
+    print(f"[Deserialize] DataStruct reconstructed: "
+          f"level={ct.level}, origin={ct.origin!r}, "
+          f"ntt={ct.ntt_state}, montgomery={ct.montgomery_state}")
+    return ct
+
 def engine_init():
     print("engine init: ", end="")
     params = {"logN":16, "scale_bits": 41, "num_special_primes": 4, "quantum":"pre_quantum"}
@@ -72,21 +405,25 @@ def key_init(engine, key_path):
     gc.collect()
     torch.cuda.empty_cache()
 
-    rotk_dict = {}
+    host_store = {}
     numkeys = len(rotk_dict_keys)
-    loaded_stat = 0
-    for key in rotk_dict_keys:
-        rotk_dict[key] = engine.load(f"{key_path}/rotk_dict/{key}", move_to_gpu = False)
-        gc.collect()
-        torch.cuda.empty_cache()
-        loaded_stat += 1
-        print(f"loaded keys: {loaded_stat}/{numkeys}")
+
+    for i, key in enumerate(rotk_dict_keys, 1):
+        host_store[key] = engine.load(
+            f"{key_path}/rotk_dict/{key}",
+            move_to_gpu=False          # stays on CPU DRAM
+        )
+        print(f"loaded keys (CPU): {i}/{numkeys}")
+
     bs.create_cts_stc_const(engine)
-    engine.add_bs_key(rotk_dict)
+
+    lru_cache = LRUBootstrapKeyCache(engine, host_store,
+                                     max_gpu_keys=10)
+    engine.add_bs_key(lru_cache)
 
     gc.collect()
-    print("DONE")
-    
+    torch.cuda.empty_cache()
+
     print("pk: ", end="")
     pk = engine.load(f"{key_path}/pk")
     engine.add_pk(pk)
@@ -143,7 +480,7 @@ def UDS_init():
     print("DONE")
     return server
 
-def read_ciphertext(conn, mask, cid):
+def read_ciphertext(conn, mask, cid, engine):
     data = conn.recv(128)
     if data:
         print("Interrupt received! Processing metadata...")
@@ -174,17 +511,14 @@ def read_ciphertext(conn, mask, cid):
         
             local_mr = cid.reg_msgs(length)
             print("MR set")
-            
-            if 1: # Success
-                print("RDMA Read Successful!")
-                # Verify by reading the local buffer content
-                print(f"Data from Host: {local_mr.read(32, 0).decode()}")
-            else:
-                #print(f"RDMA Read Failed. Status code: {wc.status}")
-                print("ff")
+            cid.post_read(local_mr, length, addr, rkey)
+
+            ct = ct_deserialization(local_mr, length)
+            res_ct = engine.bootstrap(ct)
+            new_mr = ct_serialization(res_ct, cid)
 
             print("Post SEND")
-            cid.post_send(local_mr, length)
+            cid.post_send(new_mr, length)
             print("Successful")
 
 
@@ -197,12 +531,12 @@ def read_ciphertext(conn, mask, cid):
     sel.unregister(conn)
     conn.close()
 
-def accept_connection(sock, mask, cid):
+def accept_connection(sock, mask, cid, engine):
     conn, _ = sock.accept()
     conn.setblocking(False)
     # Register the 'read' event for this specific connection
     sel.register(conn, selectors.EVENT_READ,
-                data=lambda key_obj, mask_val: read_ciphertext(key_obj.fileobj, mask_val, cid))
+                data=lambda key_obj, mask_val: read_ciphertext(key_obj.fileobj, mask_val, cid, engine))
 
 def main():
     #key_path = sys.argv[1]
@@ -211,7 +545,7 @@ def main():
     key_init(engine, key_path)
     server = UDS_init()
     sel.register(server, selectors.EVENT_READ,
-                 data=lambda key_obj, mask_val: accept_connection(key_obj.fileobj, mask_val, cid))
+                 data=lambda key_obj, mask_val: accept_connection(key_obj.fileobj, mask_val, cid, engine))
     cid = RDMA_init()
     print("Python is ready. Waiting for asynchronous events...")
     try:
