@@ -203,65 +203,6 @@ def compute_struct_size(ct: DataStruct) -> int:
         total_bytes += tensor.nelement() * tensor.element_size()
     return total_bytes
 
-'''
-def ct_serialization(ct: DataStruct, cmid):
-    # =========================================================================
-    # STEP 1: Calculate the total ciphertext payload size
-    # =========================================================================
-    total_bytes = 0
-    for tensor in ct.data:
-        if not tensor.is_cuda:
-            raise ValueError("Tensor must be in GPU memory!")
-        total_bytes += tensor.nelement() * tensor.element_size()
-        
-    print(f"[Step 1] Calculated total size: {total_bytes} bytes")
-
-    # =========================================================================
-    # STEP 2: Initialize the buffer via pyverbs (Allocates via mmap internally)
-    # =========================================================================
-    # Your method returns the registered Memory Region object
-    mr = cmid.reg_msgs(total_bytes)
-    
-    # pyverbs MR objects expose 'buf' (a buffer protocol object) and/or a raw pointer.
-    # We grab the raw virtual memory address allocated by the mmap.
-    # Depending on your exact pyverbs wrapper version, it's typically:
-    # mr.buf or ctypes.cast(mr.buf, ctypes.c_void_p).value
-    
-    #mr_pointer = ctypes.addressof(ctypes.c_char.from_buffer(mr.buf))
-    mr_pointer = mr.buf
-    
-    print(f"[Step 2] pyverbs MR initialized via mmap at Host Address: {hex(mr_pointer)}")
-
-    # =========================================================================
-    # STEP 3: Zero-Copy Serialization from GPU directly into the mmap pointer
-    # =========================================================================
-    current_offset = 0
-    
-    for tensor in ct.data:
-        num_bytes = tensor.nelement() * tensor.element_size()
-        
-        # Calculate the target address inside the mmap buffer for this specific tensor chunk
-        target_chunk_addr = mr_pointer + current_offset
-        
-        # Create a Python ctypes array wrapping this specific memory slice
-        # matching the data type (e.g., c_int64, c_double, etc.)
-        # For universal copying, we can treat it as an array of uint8 bytes
-        ctypes_array = (ctypes.c_uint8 * num_bytes).from_address(target_chunk_addr)
-        
-        # Create a view that PyTorch can write into from the raw ctypes interface
-        host_view = torch.frombuffer(ctypes_array, dtype=torch.uint8).view(tensor.dtype).view(tensor.shape)
-        
-        # Stream the data directly via PCIe DMA from GPU DRAM into the mmap Huge Page memory
-        host_view.copy_(tensor, non_blocking=True)
-        
-        current_offset += num_bytes
-        
-    # Block Python execution until the GPU finish copying data to the Host RAM
-    torch.cuda.synchronize()
-    print("[Step 3] Serialization and Direct GPU -> mmap Host copy complete.")
-    
-    return mr, total_bytes
-'''
 
 def ct_serialization(ct: DataStruct, cmid):
     # ── 1. Build header JSON ──────────────────────────────────────────────────
