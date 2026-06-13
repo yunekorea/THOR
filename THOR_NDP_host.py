@@ -817,9 +817,12 @@ def forward_layer(x):
     thor_ff.cpu()
     return ln2_out, (x, q_wo_rescale, sftmx_in, sftmx_out, att_context, ln1_in, ln1_out, gelu_in_wo_bs, gelu_out, dense2_out, ln2_in, ln2_out)
 
-print("Forwarding layer #0:", end="")
-layer_idx = 0
-thor_attention = thor_bert.attentions[layer_idx]
-thor_ff = thor_bert.ffs[layer_idx]
-x1, variables =  forward_layer(x)
-print("DONE")
+for layer_idx in range(12):
+    print(f"Forwarding layer #{layer_idx}: ", end="")
+    
+    thor_attention = thor_bert.attentions[layer_idx]
+    thor_ff = thor_bert.ffs[layer_idx]
+    
+    x1, variables = forward_layer(x)
+    
+    print("DONE")
