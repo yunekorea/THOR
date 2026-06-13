@@ -608,6 +608,7 @@ for batch in data_loader:
         thor_attention_mask = data_encryptor.encode_attention_mask(attention_mask.cpu().numpy().squeeze().T, level=15)
         break
 
+'''
 print("Load and Run Plain Model:", end="")
 model_plain  = thor.utils.load_model(dataset_type, f'./finetuned_models/{dataset_type}/model.safetensors')
 model_plain.eval()
@@ -703,6 +704,7 @@ for layer in range(12):
     ln2_ins.append(ln2_in)
     ln2_outs.append(ln2_out)
 print("DONE")
+'''
 
 print("Load Model Weights: ", end="")
 with open(f"./encoded_models_new/{dataset_type}/att.pkl", 'rb') as f:
