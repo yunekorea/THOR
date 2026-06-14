@@ -485,12 +485,7 @@ gk = engine.load(f"./keys/keys0/gk")
 engine.add_gk(gk)
 conjk = engine.load(f"./keys/keys0/conjk")
 engine.add_conj_key(conjk)
-'''
-rotk_dict = {}
-for key in rotk_dict_keys:
-    rotk_dict[key] = engine.load(f"./keys/keys0/rotk_dict/{key}", move_to_gpu = False)
-bs.create_cts_stc_const(engine)
-engine.add_bs_key(rotk_dict)
+
 '''
 host_store = {}
 numkeys = len(rotk_dict_keys)
@@ -500,7 +495,7 @@ for i, key in enumerate(rotk_dict_keys, 1):
         f"./keys/keys0/rotk_dict/{key}",
         move_to_gpu=False          # stays on CPU DRAM
     )
-    print(f"loaded keys (CPU): {i}/{numkeys}")
+    #print(f"loaded keys (CPU): {i}/{numkeys}")
 
 bs.create_cts_stc_const(engine)
 
@@ -508,8 +503,9 @@ lru_cache = LRUBootstrapKeyCache(engine, host_store,
                                     max_gpu_keys=30)
 engine.add_bs_key(lru_cache)
 #engine.add_rot_keys_from_sk(deltas, sk)
-print("DONE")
 print("Memory allocated: ", torch.cuda.memory_allocated(devices[0]) /1024**3)
+'''
+print("DONE")
 
 print("RDMA connecting: ", end="")
 dev_name = "rocep59s0".encode('utf-8')

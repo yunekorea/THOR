@@ -384,7 +384,7 @@ def key_init(engine, key_path):
     bs.create_cts_stc_const(engine)
 
     lru_cache = LRUBootstrapKeyCache(engine, host_store,
-                                     max_gpu_keys=10)
+                                     max_gpu_keys=20)
     engine.add_bs_key(lru_cache)
     print("DONE")
 
