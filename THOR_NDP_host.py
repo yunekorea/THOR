@@ -247,14 +247,14 @@ def ct_serialization(ct: DataStruct, cmid):
     tensor_data_offset = _align_up(preamble_size, _ALIGN)
     total_mr_size      = tensor_data_offset + total_tensor_bytes
 
-    print(f"[Step 1] MR layout: {preamble_size}B preamble + "
-          f"{tensor_data_offset - preamble_size}B padding + "
-          f"{total_tensor_bytes}B tensor payload = {total_mr_size}B total")
+    #print(f"[Step 1] MR layout: {preamble_size}B preamble + "
+    #      f"{tensor_data_offset - preamble_size}B padding + "
+    #      f"{total_tensor_bytes}B tensor payload = {total_mr_size}B total")
 
     # ── 4. Allocate RDMA MR ───────────────────────────────────────────────────
     mr         = cmid.reg_read(total_mr_size)
     mr_pointer = mr.buf
-    print(f"[Step 2] MR allocated at host address: {hex(mr_pointer)}")
+    #print(f"[Step 2] MR allocated at host address: {hex(mr_pointer)}")
 
     # ── 5. Write preamble into MR ─────────────────────────────────────────────
     preamble = (
@@ -266,7 +266,7 @@ def ct_serialization(ct: DataStruct, cmid):
     )
     preamble_arr = (ctypes.c_uint8 * len(preamble)).from_address(mr_pointer)
     preamble_arr[:] = preamble
-    print(f"[Step 3] Preamble written ({len(preamble)}B)")
+    #print(f"[Step 3] Preamble written ({len(preamble)}B)")
 
     # ── 6. Copy tensors GPU → MR ──────────────────────────────────────────────
     current_offset = tensor_data_offset
@@ -282,7 +282,7 @@ def ct_serialization(ct: DataStruct, cmid):
             current_offset += nbytes
 
     torch.cuda.synchronize()
-    print(f"[Step 4] Tensors copied GPU → MR.")
+    #print(f"[Step 4] Tensors copied GPU → MR.")
 
     return mr, total_mr_size
 
@@ -341,8 +341,8 @@ def ct_deserialization(mr, total_mr_size: int, device=None) -> DataStruct:
         data.append(poly_list)
 
     torch.cuda.synchronize()
-    print(f"[Deserialize] {sum(len(p) for p in data)} tensor(s) across "
-          f"{len(data)} poly_list(s) loaded onto {device}.")
+    #print(f"[Deserialize] {sum(len(p) for p in data)} tensor(s) across "
+    #      f"{len(data)} poly_list(s) loaded onto {device}.")
 
     # ── 7. Rebuild DataStruct ─────────────────────────────────────────────────
     ct = DataStruct(
@@ -357,9 +357,9 @@ def ct_deserialization(mr, total_mr_size: int, device=None) -> DataStruct:
         version          = header["version"],
     )
 
-    print(f"[Deserialize] DataStruct reconstructed: "
-          f"level={ct.level}, origin={ct.origin!r}, "
-          f"ntt={ct.ntt_state}, montgomery={ct.montgomery_state}")
+    #print(f"[Deserialize] DataStruct reconstructed: "
+    #      f"level={ct.level}, origin={ct.origin!r}, "
+    #      f"ntt={ct.ntt_state}, montgomery={ct.montgomery_state}")
     return ct
 
 def nvme_passthru(mr, fd):
@@ -370,9 +370,9 @@ def nvme_passthru(mr, fd):
         "devnamelen": dev_name_len,
         "devname": dev_name
     }
-    print(f"rkey: {hex(mr.rkey)}")
-    print(f"addr: {hex(mr.buf)}")
-    print(f"length:{mr.length}")
+    #print(f"rkey: {hex(mr.rkey)}")
+    #print(f"addr: {hex(mr.buf)}")
+    #print(f"length:{mr.length}")
 
 
     cmd = nvme.ndp_passthru_cmd()
