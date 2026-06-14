@@ -234,14 +234,14 @@ def ct_serialization(ct: DataStruct, cmid):
     tensor_data_offset = _align_up(preamble_size, _ALIGN)
     total_mr_size      = tensor_data_offset + total_tensor_bytes
 
-    print(f"[Step 1] MR layout: {preamble_size}B preamble + "
-          f"{tensor_data_offset - preamble_size}B padding + "
-          f"{total_tensor_bytes}B tensor payload = {total_mr_size}B total")
+    #print(f"[Step 1] MR layout: {preamble_size}B preamble + "
+    #      f"{tensor_data_offset - preamble_size}B padding + "
+    #      f"{total_tensor_bytes}B tensor payload = {total_mr_size}B total")
 
     # ── 4. Allocate RDMA MR ───────────────────────────────────────────────────
     mr         = cmid.reg_msgs(total_mr_size)
     mr_pointer = mr.buf
-    print(f"[Step 2] MR allocated at host address: {hex(mr_pointer)}")
+    #print(f"[Step 2] MR allocated at host address: {hex(mr_pointer)}")
 
     # ── 5. Write preamble into MR ─────────────────────────────────────────────
     preamble = (
@@ -253,7 +253,7 @@ def ct_serialization(ct: DataStruct, cmid):
     )
     preamble_arr = (ctypes.c_uint8 * len(preamble)).from_address(mr_pointer)
     preamble_arr[:] = preamble
-    print(f"[Step 3] Preamble written ({len(preamble)}B)")
+    #print(f"[Step 3] Preamble written ({len(preamble)}B)")
 
     # ── 6. Copy tensors GPU → MR ──────────────────────────────────────────────
     current_offset = tensor_data_offset
@@ -269,7 +269,7 @@ def ct_serialization(ct: DataStruct, cmid):
             current_offset += nbytes
 
     torch.cuda.synchronize()
-    print(f"[Step 4] Tensors copied GPU → MR.")
+    #print(f"[Step 4] Tensors copied GPU → MR.")
 
     return mr, total_mr_size
 
@@ -328,8 +328,8 @@ def ct_deserialization(mr, total_mr_size: int, device=None) -> DataStruct:
         data.append(poly_list)
 
     torch.cuda.synchronize()
-    print(f"[Deserialize] {sum(len(p) for p in data)} tensor(s) across "
-          f"{len(data)} poly_list(s) loaded onto {device}.")
+    #print(f"[Deserialize] {sum(len(p) for p in data)} tensor(s) across "
+    #      f"{len(data)} poly_list(s) loaded onto {device}.")
 
     # ── 7. Rebuild DataStruct ─────────────────────────────────────────────────
     ct = DataStruct(
@@ -372,19 +372,21 @@ def key_init(engine, key_path):
 
     host_store = {}
     numkeys = len(rotk_dict_keys)
-
+    
+    print("ROTK dict(Btstrp): ", end="")
     for i, key in enumerate(rotk_dict_keys, 1):
         host_store[key] = engine.load(
             f"{key_path}/rotk_dict/{key}",
             move_to_gpu=False          # stays on CPU DRAM
         )
-        print(f"loaded keys (CPU): {i}/{numkeys}")
+        #print(f"loaded keys (CPU): {i}/{numkeys}")
 
     bs.create_cts_stc_const(engine)
 
     lru_cache = LRUBootstrapKeyCache(engine, host_store,
                                      max_gpu_keys=10)
     engine.add_bs_key(lru_cache)
+    print("DONE")
 
     gc.collect()
     torch.cuda.empty_cache()
@@ -409,7 +411,6 @@ def key_init(engine, key_path):
     del conjk
     gc.collect()
     print("DONE")
-    print("ROTK dict: ", end="")
 
 def RDMA_init():
     dev_name = "mlx5_0".encode('utf-8')
@@ -463,35 +464,34 @@ def read_ciphertext(conn, mask, cid, engine):
             # Decode the name and strip null bytes (\x00)
             device_name = unpacked[4][:name_length].decode('utf-8').strip('\x00')
             
-            print(f"--- Decoded Metadata ---")
-            print(f"Address:     {hex(addr)}")
-            print(f"R-Key:       {hex(rkey)}")
-            print(f"Length:      {length}")
-            print(f"Name Length: {name_length}")
-            print(f"Device Name: {device_name}")
+            #print(f"--- Decoded Metadata ---")
+            #print(f"Address:     {hex(addr)}")
+            #print(f"R-Key:       {hex(rkey)}")
+            #print(f"Length:      {length}")
+            #print(f"Name Length: {name_length}")
+            #print(f"Device Name: {device_name}")
             
             # Now you can proceed with your RDMA logic using these variables
-            print("cid.connect() start")
             #cid.connect()
         
             local_mr = cid.reg_msgs(length)
-            print("MR set")
+            #print("MR set")
             cid.post_read(local_mr, length, addr, rkey)
             wc = cid.get_send_comp()
             if wc is None:
                 raise RuntimeError("No READ completion returned")
 
-            print(
-                f"READ completion: status={wc.status} "
-                f"opcode={wc.opcode} "
-                f"bytes={wc.byte_len}"
-            )
+            #print(
+            #    f"READ completion: status={wc.status} "
+            #    f"opcode={wc.opcode} "
+            #    f"bytes={wc.byte_len}"
+            #)
 
             ct = ct_deserialization(local_mr, length)
             res_ct = engine.bootstrap(ct)
             new_mr , new_size = ct_serialization(res_ct, cid)
 
-            print("Post SEND")
+            print("Post SEND: ", end="")
             cid.post_send(new_mr, new_size)
             wc = cid.get_send_comp()
             if wc is None:
