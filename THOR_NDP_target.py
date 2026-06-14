@@ -204,6 +204,8 @@ def ct_serialization(ct: DataStruct, cmid):
         "version":          ct.version,
     }
     header_bytes = json.dumps(header).encode("utf-8")
+    print(f"[Serialize] DataStruct BEFORE Serialization(Target - after BS): "
+          f"level={ct.level}, level_calc={ct.level_calc}, level_avail={ct.level_available}")
 
     # ── 2. Build tensor-meta JSON (nested list mirrors ct.data structure) ─────
     tensor_meta = []
@@ -344,7 +346,7 @@ def ct_deserialization(mr, total_mr_size: int, device=None) -> DataStruct:
         version          = header["version"],
     )
 
-    print(f"[Deserialize] DataStruct AFTER Deserialization: "
+    print(f"[Deserialize] DataStruct AFTER Deserialization(Target - before BS): "
           f"level={ct.level}, level_calc={ct.level_calc}, level_avail={ct.level_available}")
     
     return ct

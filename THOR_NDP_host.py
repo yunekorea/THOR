@@ -220,7 +220,7 @@ def ct_serialization(ct: DataStruct, cmid):
     }
     header_bytes = json.dumps(header).encode("utf-8")
     
-    print(f"[Serialize] DataStruct before Serialization: "
+    print(f"[Serialize] DataStruct BEFORE Serialization(Host - before BS): "
           f"level={ct.level}, origin={ct.origin!r}, "
           f"ntt={ct.ntt_state}, montgomery={ct.montgomery_state}")
 
