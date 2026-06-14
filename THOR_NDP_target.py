@@ -234,9 +234,9 @@ def ct_serialization(ct: DataStruct, cmid):
     tensor_data_offset = _align_up(preamble_size, _ALIGN)
     total_mr_size      = tensor_data_offset + total_tensor_bytes
 
-    #print(f"[Step 1] MR layout: {preamble_size}B preamble + "
-    #      f"{tensor_data_offset - preamble_size}B padding + "
-    #      f"{total_tensor_bytes}B tensor payload = {total_mr_size}B total")
+    print(f"Target MR layout(After BS): {preamble_size}B preamble + "
+          f"{tensor_data_offset - preamble_size}B padding + "
+          f"{total_tensor_bytes}B tensor payload = {total_mr_size}B total")
 
     # ── 4. Allocate RDMA MR ───────────────────────────────────────────────────
     mr         = cmid.reg_msgs(total_mr_size)
