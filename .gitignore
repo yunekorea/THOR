@@ -6,3 +6,4 @@ liberate/csprng/
 liberate/src/liberate/fhe/cache/resources/*uniform.pkl
 *.pyc
 *.so
+run_nvmf.sh
