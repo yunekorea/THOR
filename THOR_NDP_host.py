@@ -217,6 +217,10 @@ def ct_serialization(ct: DataStruct, cmid):
         "version":          ct.version,
     }
     header_bytes = json.dumps(header).encode("utf-8")
+    
+    print(f"[Serialize] DataStruct before Serialization: "
+          f"level={ct.level}, origin={ct.origin!r}, "
+          f"ntt={ct.ntt_state}, montgomery={ct.montgomery_state}")
 
     # ── 2. Build tensor-meta JSON (nested list mirrors ct.data structure) ─────
     tensor_meta = []
