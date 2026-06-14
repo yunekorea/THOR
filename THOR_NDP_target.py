@@ -386,7 +386,7 @@ def key_init(engine, key_path):
     bs.create_cts_stc_const(engine)
 
     lru_cache = LRUBootstrapKeyCache(engine, host_store,
-                                     max_gpu_keys=20)
+                                     max_gpu_keys=35)
     engine.add_bs_key(lru_cache)
     print("DONE")
 
@@ -522,10 +522,10 @@ def accept_connection(sock, mask, cid, engine):
 def main():
     #key_path = sys.argv[1]
     key_path = "/mnt/nvmf/THOR_test/THOR/keys/keys0"
+    cid = RDMA_init()
     engine = engine_init()
     key_init(engine, key_path)
     server = UDS_init()
-    cid = RDMA_init()
     sel.register(server, selectors.EVENT_READ,
                  data=lambda key_obj, mask_val: accept_connection(key_obj.fileobj, mask_val, cid, engine))
     print("Python is ready. Waiting for asynchronous events...")
