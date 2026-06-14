@@ -85,42 +85,15 @@ class CkksEngine(ckks_engine):
             with torch.cuda.device(device):
                 torch.cuda.empty_cache()
         temp = ct
-        print("CKKS - Bootstrap function")
-        print(f"Class Name: {ct.__class__.__name__}")
-        print(f"Defined in module: {ct.__class__.__module__}")
-        print(f"Tensor 0 Shape: {ct.data[0][0].shape}")
-        print(f"Tensor 0 Dtype: {ct.data[0][0].dtype}")
-        total_payload_bytes = 0
-        for poly_list in ct.data:
-            for tensor in poly_list:
-                # element_size() is 8 bytes for int64/uint64
-                # nelement() is the total number of coefficients (N * L)
-                total_payload_bytes += tensor.nelement() * tensor.element_size()
-        header_size = 4096 
-        total_size = total_payload_bytes + header_size
-        print(f"Total size: {total_size}")
-        #print(f"Type of CT: {ct}")
-        #print(f"Raw Data Pointer: {hex(ct.data.__array_interface__['data'][0]) if hasattr(ct.data, '__array_interface__') else 'N/A'}")
-        print(f"Total size(Before BS): {total_size}")
-
+        #print("CKKS - Bootstrap function")
+        #print(f"Class Name: {ct.__class__.__name__}")
+        #print(f"Defined in module: {ct.__class__.__module__}")
+        #print(f"Tensor 0 Shape: {ct.data[0][0].shape}")
+        #print(f"Tensor 0 Dtype: {ct.data[0][0].dtype}")
         ct_bs = bs.bootstrap(self, temp, self.bs_key, self.evk, self.conj_key, self.pk)
-
-        if hasattr(self.bs_key, 'cache_stats'):
-            print(f"BS key cache stats: {self.bs_key.cache_stats}")
-            print(f"GPU-resident keys:  {self.bs_key.gpu_resident_keys}")
         for device in self.ntt.devices:
             with torch.cuda.device(device):
                 torch.cuda.empty_cache()
-        
-        total_payload_bytes = 0
-        for poly_list in ct.data:
-            for tensor in poly_list:
-                # element_size() is 8 bytes for int64/uint64
-                # nelement() is the total number of coefficients (N * L)
-                total_payload_bytes += tensor.nelement() * tensor.element_size()
-        total_size = total_payload_bytes + header_size
-        print(f"Total size(After BS): {total_size}")
-        
         return ct_bs
     
     #Mult
