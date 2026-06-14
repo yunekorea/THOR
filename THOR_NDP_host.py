@@ -23,6 +23,7 @@ from thor import CkksEngine, ThorDataEncryptor, ThorLinearEvaluator
 from thor.bert import ThorBert, ThorBertFF, ThorBertPooler, ThorBertClassifier
 from liberate.fhe.data_struct import DataStruct
 
+from thor import CkksNDPEngine
 
 #Modules for NDP, RDMA
 import pprint
@@ -465,13 +466,29 @@ def encode_attention_mask(engine, attention_mask:np.ndarray, level:int=15) -> np
         attention_mask[i] = engine.encode(msg, level)
     return attention_mask
 
+print("RDMA connecting: ", end="")
+dev_name = "rocep59s0".encode('utf-8')
+dev_name_len = len(dev_name)
+# Initialize CIMD
+cap = QPCap(max_send_wr=16, max_recv_wr=16, max_send_sge=8)
+qp_init_attr = QPInitAttr(cap=cap)
+host_ip = "192.168.100.2"
+target_ip = "192.168.100.1"
+
+sai = AddrInfo(src = host_ip ,dst=target_ip, dst_service="9999",
+                port_space = rdma_port_space.RDMA_PS_TCP)
+#print(f"Connecting to Host at {host_ip}...")
+sid = CMID(creator=sai, qp_init_attr=qp_init_attr)
+sid.connect()
+print("DONE")
 
 with torch.cuda.device(devices[0]):
     torch.cuda.empty_cache()
     print(torch.cuda.memory_allocated(devices[0]) /1024**3)
 
 params = {"logN":16, "scale_bits": 41, "num_special_primes": 4, "devices": devices, "quantum":"pre_quantum"}
-engine = CkksEngine(params)
+#engine = CkksEngine(params)
+engine = CkksNDPEngine(sid, params)
 print("Memory allocated: ", torch.cuda.memory_allocated(devices[0]) /1024**3)
 
 
@@ -507,24 +524,6 @@ print("Memory allocated: ", torch.cuda.memory_allocated(devices[0]) /1024**3)
 '''
 print("DONE")
 
-print("RDMA connecting: ", end="")
-dev_name = "rocep59s0".encode('utf-8')
-dev_name_len = len(dev_name)
-# Initialize CIMD
-cap = QPCap(max_send_wr=16, max_recv_wr=16, max_send_sge=8)
-qp_init_attr = QPInitAttr(cap=cap)
-host_ip = "192.168.100.2"
-target_ip = "192.168.100.1"
-#sai = AddrInfo(src=host_ip, src_service="9999",
-#                port_space = rdma_port_space.RDMA_PS_TCP, flags = RAI_PASSIVE)
-
-sai = AddrInfo(src = host_ip ,dst=target_ip, dst_service="9999",
-                port_space = rdma_port_space.RDMA_PS_TCP)
-print(f"Connecting to Host at {host_ip}...")
-sid = CMID(creator=sai, qp_init_attr=qp_init_attr)
-#sid.listen()
-sid.connect()
-print("DONE")
 #rdmaid = sid.get_request()
 #rdmaid.accept()
 #NDP file descriptor open
