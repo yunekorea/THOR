@@ -3,4 +3,3 @@ from .ckks import CkksEngine
 from .linear import ThorLinearEvaluator
 from .data import ThorDataEncryptor
 from .bert import ThorBert
-from .ckks_ndp import CkksNDPEngine

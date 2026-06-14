@@ -23,7 +23,9 @@ from thor import CkksEngine, ThorDataEncryptor, ThorLinearEvaluator
 from thor.bert import ThorBert, ThorBertFF, ThorBertPooler, ThorBertClassifier
 from liberate.fhe.data_struct import DataStruct
 
-from thor import CkksNDPEngine
+#from thor import CkksNDPEngine
+
+from thor.ckks_ndp import CkksNDPEngine
 
 #Modules for NDP, RDMA
 import pprint
