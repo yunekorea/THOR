@@ -22,10 +22,9 @@ import thor
 from thor import CkksEngine, ThorDataEncryptor, ThorLinearEvaluator
 from thor.bert import ThorBert, ThorBertFF, ThorBertPooler, ThorBertClassifier
 from liberate.fhe.data_struct import DataStruct
+from thor.ckks_ndp import CkksNDPEngine
 
 #from thor import CkksNDPEngine
-
-from thor.ckks_ndp import CkksNDPEngine
 
 #Modules for NDP, RDMA
 import pprint
@@ -722,8 +721,8 @@ def forward_layer(x):
     for i in range(4):
         temp = engine.cc_add(sftmx_in[i], engine.imult(sftmx_in[i+4]))
         # Bootstrap #1
-        #temp = engine.bootstrap(temp)
-        temp = bs_offload(temp, sid)
+        temp = engine.bootstrap(temp)
+        #temp = bs_offload(temp, sid)
         conj = engine.conjugate(temp)
         sftmx_in[i] = engine.cc_add(temp, conj)
         sftmx_in[i+4] = engine.imult(engine.cc_sub(conj, temp))
@@ -750,8 +749,8 @@ def forward_layer(x):
 
     # Bootstrap #2
     for i in range(2):
-        #att_context[i] = engine.bootstrap(att_context[i])
-        att_context[i] = bs_offload(att_context[i], sid)
+        att_context[i] = engine.bootstrap(att_context[i])
+        #att_context[i] = bs_offload(att_context[i], sid)
 
     att_context_rots = thor_attention.evaluator.make_rotated_copies(att_context)
     dense_output = thor_attention.dense(att_context_rots)
@@ -782,8 +781,8 @@ def forward_layer(x):
         temp = engine.cc_add(gelu_in_wo_bs[0,i], engine.imult(gelu_in_wo_bs[1,i]))
         temp = engine.mult_scalar(temp, 1/2)
         #Bootstrap #3
-        #temp = engine.bootstrap(temp)
-        temp = bs_offload(temp, sid)
+        temp = engine.bootstrap(temp)
+        #temp = bs_offload(temp, sid)
         conj = engine.conjugate(temp)
         gelu_in_wo_bs[0,i] = engine.cc_add(temp, conj)
         gelu_in_wo_bs[1,i] = engine.imult(engine.cc_sub(conj, temp))
@@ -798,8 +797,8 @@ def forward_layer(x):
     for i in range(4):
         temp = engine.cc_add(ln2_in[i], engine.imult(ln2_in[i+4]))
         # Bootstrap #4
-        #temp = engine.bootstrap(temp)
-        temp = bs_offload(temp, sid)
+        temp = engine.bootstrap(temp)
+        #temp = bs_offload(temp, sid)
         conj = engine.conjugate(temp)
         ln2_in[i] = engine.cc_add(temp, conj)
         ln2_in[i+4] = engine.imult(engine.cc_sub(conj, temp)) 

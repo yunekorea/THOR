@@ -48,9 +48,8 @@ class CkksNDPEngine(CkksEngine):
         }
         header_bytes = json.dumps(header).encode("utf-8")
         
-        print(f"[Serialize] DataStruct before Serialization: "
-            f"level={ct.level}, origin={ct.origin!r}, "
-            f"ntt={ct.ntt_state}, montgomery={ct.montgomery_state}")
+        print(f"[Serialize] DataStruct BEFORE Serialization: "
+            f"level={ct.level}, level_calc={ct.level_calc}, level_avil={ct.level_available}")
 
         # ── 2. Build tensor-meta JSON (nested list mirrors ct.data structure) ─────
         tensor_meta = []
@@ -191,9 +190,8 @@ class CkksNDPEngine(CkksEngine):
             version          = header["version"],
         )
 
-        #print(f"[Deserialize] DataStruct reconstructed: "
-        #      f"level={ct.level}, origin={ct.origin!r}, "
-        #      f"ntt={ct.ntt_state}, montgomery={ct.montgomery_state}")
+        print(f"[Deserialize] DataStruct AFTER Deserialization: "
+              f"level={ct.level}, level_calc={ct.level_calc}, level_avil={ct.level_available}")
         return ct
 
     def nvme_passthru(self, mr):

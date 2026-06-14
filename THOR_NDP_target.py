@@ -344,9 +344,9 @@ def ct_deserialization(mr, total_mr_size: int, device=None) -> DataStruct:
         version          = header["version"],
     )
 
-    print(f"[Deserialize] DataStruct reconstructed: "
-          f"level={ct.level}, origin={ct.origin!r}, "
-          f"ntt={ct.ntt_state}, montgomery={ct.montgomery_state}")
+    print(f"[Deserialize] DataStruct AFTER Deserialization: "
+          f"level={ct.level}, level_calc={ct.level_calc}, level_avail={ct.level_available}")
+    
     return ct
 
 def engine_init():
