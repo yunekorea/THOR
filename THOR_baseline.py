@@ -203,8 +203,7 @@ with torch.cuda.device(devices[0]):
     print(torch.cuda.memory_allocated(devices[0]) /1024**3)
 
 params = {"logN":16, "scale_bits": 41, "num_special_primes": 4, "devices": devices, "quantum":"pre_quantum"}
-#engine = CkksEngine(params)
-engine = CkksNDPEngine(sid, params)
+engine = CkksEngine(params)
 print("Memory allocated: ", torch.cuda.memory_allocated(devices[0]) /1024**3)
 
 
