@@ -292,6 +292,10 @@ class CkksNDPEngine(CkksEngine):
         rmr, new_ct_size = self.receive_bs_result(ct_size)
         result_ct = self.ct_deserialization(rmr, new_ct_size)
 
+        print(f"[Post-BS] level_calc={result_ct.level_calc}, level_available={result_ct.level_available}")
+        for i, poly in enumerate(result_ct.data):
+            for j, tensor in enumerate(poly):
+                print(f"  data[{i}][{j}].shape = {tensor.shape}")
 
         # --- Post-bootstrap GPU cache flush (mirrors parent behaviour) ---
         for device in self.ntt.devices:

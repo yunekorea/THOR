@@ -85,6 +85,9 @@ class CkksEngine(ckks_engine):
             with torch.cuda.device(device):
                 torch.cuda.empty_cache()
         temp = ct
+        print(f"CT level before BS): "
+          f"level={temp.level}, level_calc={temp.level_calc}, level_avail={temp.level_available}")
+
         #print("CKKS - Bootstrap function")
         #print(f"Class Name: {ct.__class__.__name__}")
         #print(f"Defined in module: {ct.__class__.__module__}")
@@ -94,6 +97,8 @@ class CkksEngine(ckks_engine):
         for device in self.ntt.devices:
             with torch.cuda.device(device):
                 torch.cuda.empty_cache()
+        print(f"CT level after BS): "
+          f"level={ct_bs.level}, level_calc={ct_bs.level_calc}, level_avail={ct_bs.level_available}")
         return ct_bs
     
     #Mult
