@@ -29,7 +29,7 @@ class CkksNDPEngine(CkksEngine):
         CustomCkksEngine is a child class of CkksEngine that overrides the bootstrap method
         with a custom implementation.
         """
-        super().__init__(params, verbose=verbose)
+        super().__init__(params)
         self.libc = ctypes.CDLL(find_library('c'))
         self.fd = nvme.nvme_open("nvme1n1")
         self.cmid = cmid
@@ -48,8 +48,8 @@ class CkksNDPEngine(CkksEngine):
         }
         header_bytes = json.dumps(header).encode("utf-8")
         
-        print(f"[Serialize] DataStruct BEFORE Serialization(Host - before BS): "
-            f"level={ct.level}, level_calc={ct.level_calc}, level_avil={ct.level_available}")
+        #print(f"[Serialize] DataStruct BEFORE Serialization(Host - before BS): "
+        #    f"level={ct.level}, level_calc={ct.level_calc}, level_avil={ct.level_available}")
 
         # ── 2. Build tensor-meta JSON (nested list mirrors ct.data structure) ─────
         tensor_meta = []
@@ -190,8 +190,8 @@ class CkksNDPEngine(CkksEngine):
             version          = header["version"],
         )
 
-        print(f"[Deserialize] DataStruct AFTER Deserialization(Host - after BS): "
-              f"level={ct.level}, level_calc={ct.level_calc}, level_avil={ct.level_available}")
+        #print(f"[Deserialize] DataStruct AFTER Deserialization(Host - after BS): "
+        #      f"level={ct.level}, level_calc={ct.level_calc}, level_avil={ct.level_available}")
         return ct
 
     def nvme_passthru(self, mr):
@@ -285,17 +285,10 @@ class CkksNDPEngine(CkksEngine):
             with torch.cuda.device(device):
                 torch.cuda.empty_cache()
 
-
-
         mr, ct_size = self.ct_serialization(ct)
         result = self.nvme_passthru(mr)
         rmr, new_ct_size = self.receive_bs_result(ct_size)
         result_ct = self.ct_deserialization(rmr, new_ct_size)
-
-        print(f"[Post-BS] level_calc={result_ct.level_calc}, level_available={result_ct.level_available}")
-        for i, poly in enumerate(result_ct.data):
-            for j, tensor in enumerate(poly):
-                print(f"  data[{i}][{j}].shape = {tensor.shape}")
 
         # --- Post-bootstrap GPU cache flush (mirrors parent behaviour) ---
         for device in self.ntt.devices:

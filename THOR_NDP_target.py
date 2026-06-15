@@ -35,6 +35,8 @@ project_root = os.path.abspath(os.path.join(os.getcwd(), '../src'))
 if project_root not in sys.path:
     sys.path.append(project_root)
 
+devices = [0]
+
 import pickle    
 import numpy as np
 import math
@@ -204,8 +206,8 @@ def ct_serialization(ct: DataStruct, cmid):
         "version":          ct.version,
     }
     header_bytes = json.dumps(header).encode("utf-8")
-    print(f"[Serialize] DataStruct BEFORE Serialization(Target - after BS): "
-          f"level={ct.level}, level_calc={ct.level_calc}, level_avail={ct.level_available}")
+    #print(f"[Serialize] DataStruct BEFORE Serialization(Target - after BS): "
+    #      f"level={ct.level}, level_calc={ct.level_calc}, level_avail={ct.level_available}")
 
     # ── 2. Build tensor-meta JSON (nested list mirrors ct.data structure) ─────
     tensor_meta = []
@@ -236,9 +238,9 @@ def ct_serialization(ct: DataStruct, cmid):
     tensor_data_offset = _align_up(preamble_size, _ALIGN)
     total_mr_size      = tensor_data_offset + total_tensor_bytes
 
-    print(f"Target MR layout(After BS): {preamble_size}B preamble + "
-          f"{tensor_data_offset - preamble_size}B padding + "
-          f"{total_tensor_bytes}B tensor payload = {total_mr_size}B total")
+    #print(f"Target MR layout(After BS): {preamble_size}B preamble + "
+    #      f"{tensor_data_offset - preamble_size}B padding + "
+    #      f"{total_tensor_bytes}B tensor payload = {total_mr_size}B total")
 
     # ── 4. Allocate RDMA MR ───────────────────────────────────────────────────
     mr         = cmid.reg_msgs(total_mr_size)
@@ -346,14 +348,16 @@ def ct_deserialization(mr, total_mr_size: int, device=None) -> DataStruct:
         version          = header["version"],
     )
 
-    print(f"[Deserialize] DataStruct AFTER Deserialization(Target - before BS): "
-          f"level={ct.level}, level_calc={ct.level_calc}, level_avail={ct.level_available}")
+    #print(f"[Deserialize] DataStruct AFTER Deserialization(Target - before BS): "
+    #      f"level={ct.level}, level_calc={ct.level_calc}, level_avail={ct.level_available}")
     
     return ct
 
 def engine_init():
     print("engine init: ", end="")
-    params = {"logN":16, "scale_bits": 41, "num_special_primes": 4, "quantum":"pre_quantum"}
+    with torch.cuda.device(devices[0]):
+        torch.cuda.empty_cache()
+    params = {"logN":16, "scale_bits": 41, "num_special_primes": 4, "devices": devices, "quantum":"pre_quantum"}
     engine = CkksEngine(params)
     print("DONE")
     return engine
@@ -451,7 +455,7 @@ def UDS_init():
 def read_ciphertext(conn, mask, cid, engine):
     data = conn.recv(128)
     if data:
-        print("Interrupt received! Processing metadata...")
+        print("Offloading received! Processing metadata...")
         # Process your RDMA logic here
         struct_format = "<QQII50s" 
         
@@ -528,7 +532,7 @@ def main():
     server = UDS_init()
     sel.register(server, selectors.EVENT_READ,
                  data=lambda key_obj, mask_val: accept_connection(key_obj.fileobj, mask_val, cid, engine))
-    print("Python is ready. Waiting for asynchronous events...")
+    print("Target is ready. Waiting for offloading events")
     try:
         while True:
             events = sel.select() # This blocks efficiently (uses epoll/kqueue)
