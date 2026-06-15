@@ -675,8 +675,8 @@ thor_bert.classifier = ThorBertClassifier(evaluator, classifier_weights)
 print("DONE")
 
 ct_test = None
-def forward_layer(x, layer_idx):
-    global engine, evaluator, thor_attention,thor_ff, thor_attention_mask, time1, time2, time3, time4, time5, time6, time7, time8, time9, time10, time11, time12, time13, time14
+def forward_layer(x, layer_idx, thor_ff):
+    global engine, evaluator, thor_attention, thor_attention_mask, time1, time2, time3, time4, time5, time6, time7, time8, time9, time10, time11, time12, time13, time14
     
     thor_attention.to(devices)
     thor_ff.to(devices)
@@ -826,6 +826,6 @@ for layer_idx in range(12):
     thor_attention = thor_bert.attentions[layer_idx]
     thor_ff = thor_bert.ffs[layer_idx]
     
-    x1, variables = forward_layer(x, layer_idx)
+    x1, variables = forward_layer(x, layer_idx, thor_ff)
     
     print("DONE")
