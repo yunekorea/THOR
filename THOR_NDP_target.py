@@ -390,7 +390,7 @@ def key_init(engine, key_path):
     bs.create_cts_stc_const(engine)
 
     lru_cache = LRUBootstrapKeyCache(engine, host_store,
-                                     max_gpu_keys=35)
+                                     max_gpu_keys=45)
     engine.add_bs_key(lru_cache)
     print("DONE")
 
@@ -455,7 +455,7 @@ def UDS_init():
 def read_ciphertext(conn, mask, cid, engine):
     data = conn.recv(128)
     if data:
-        print("Offloading received! Processing metadata...")
+        print("Offloading received! Processing...")
         # Process your RDMA logic here
         struct_format = "<QQII50s" 
         
@@ -503,6 +503,7 @@ def read_ciphertext(conn, mask, cid, engine):
             if wc is None:
                 raise RuntimeError("No send completion returned")
             print("Successful")
+            print("Bootstrapping COMPLETE")
             local_mr.close()
             new_mr.close()
 

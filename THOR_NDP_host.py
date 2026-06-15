@@ -721,7 +721,7 @@ def forward_layer(x, layer_idx, thor_ff):
     for i in range(4):
         temp = engine.cc_add(sftmx_in[i], engine.imult(sftmx_in[i+4]))
         # Bootstrap #1
-        print(f"[Pre-BS1] i={i}, temp level_calc={temp.level_calc}, level={temp.level}")
+        #print(f"[Pre-BS1] i={i}, temp level_calc={temp.level_calc}, level={temp.level}")
         temp = engine.bootstrap(temp)
         #temp = bs_offload(temp, sid)
         conj = engine.conjugate(temp)
@@ -750,7 +750,7 @@ def forward_layer(x, layer_idx, thor_ff):
 
     # Bootstrap #2
     for i in range(2):
-        print(f"[Pre-BS2] i={i}, temp level_calc={att_context[i].level_calc}, level={att_context[i].level}")
+        #print(f"[Pre-BS2] i={i}, temp level_calc={att_context[i].level_calc}, level={att_context[i].level}")
         att_context[i] = engine.bootstrap(att_context[i])
         #att_context[i] = bs_offload(att_context[i], sid)
 
@@ -781,7 +781,7 @@ def forward_layer(x, layer_idx, thor_ff):
 
     for i in range(8):
         temp = engine.cc_add(gelu_in_wo_bs[0,i], engine.imult(gelu_in_wo_bs[1,i]))
-        print(f"[Pre-BS3] i={i}, temp level_calc={temp.level_calc}, level={temp.level}")
+        #print(f"[Pre-BS3] i={i}, temp level_calc={temp.level_calc}, level={temp.level}")
         temp = engine.mult_scalar(temp, 1/2)
         #Bootstrap #3
         temp = engine.bootstrap(temp)

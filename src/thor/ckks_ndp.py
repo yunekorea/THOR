@@ -256,11 +256,11 @@ class CkksNDPEngine(CkksEngine):
         wc = self.cmid.get_recv_comp()
         if wc is None:
             raise RuntimeError("No recv completion returned")
-        print(
-                    f"RECV completion: status={wc.status} "
-                    f"opcode={wc.opcode} "
-                    f"bytes={wc.byte_len}"
-                )
+        #print(
+        #            f"RECV completion: status={wc.status} "
+        #            f"opcode={wc.opcode} "
+        #            f"bytes={wc.byte_len}"
+        #        )
 
         length = 52428800
         return rmr, length
@@ -281,6 +281,7 @@ class CkksNDPEngine(CkksEngine):
             DataStruct: Refreshed ciphertext after bootstrapping.
         """
         # --- Pre-bootstrap GPU cache flush (mirrors parent behaviour) ---
+        print("Bootstrapping Offload: ", end="")
         for device in self.ntt.devices:
             with torch.cuda.device(device):
                 torch.cuda.empty_cache()
@@ -294,5 +295,6 @@ class CkksNDPEngine(CkksEngine):
         for device in self.ntt.devices:
             with torch.cuda.device(device):
                 torch.cuda.empty_cache()
+        print("COMPLETE")
 
         return result_ct  # noqa: F821  (defined once TODO block is filled in)
