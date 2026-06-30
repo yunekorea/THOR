@@ -24,6 +24,8 @@ from thor.bert import ThorBert, ThorBertFF, ThorBertPooler, ThorBertClassifier
 from liberate.fhe.data_struct import DataStruct
 from thor.ckks_ndp import CkksNDPEngine
 
+from codetiming import Timer as timer
+
 #from thor import CkksNDPEngine
 
 #Modules for NDP, RDMA
@@ -81,10 +83,10 @@ h_indices = [np.where(np.arange(0, 2**11) % 16 == i) for i in range(12)]
 _MAGIC = b"LBFHE001"
 _ALIGN  = 64   # align tensor data to 64-byte boundary (cache-line friendly)
 
+key_timer = timer(name = "key_timer")
 
 def _align_up(n: int, align: int) -> int:
     return int(math.ceil(n / align) * align)
-
 
 
 class LRUBootstrapKeyCache:
@@ -494,6 +496,7 @@ print("Memory allocated: ", torch.cuda.memory_allocated(devices[0]) /1024**3)
 
 
 print("Key Loading: ", end="")
+key_timer.start()
 #sk = engine.load("./keys/keys0/sk")
 pk = engine.load(f"./keys/keys0/pk")
 engine.add_pk(pk)
@@ -523,6 +526,7 @@ engine.add_bs_key(lru_cache)
 #engine.add_rot_keys_from_sk(deltas, sk)
 print("Memory allocated: ", torch.cuda.memory_allocated(devices[0]) /1024**3)
 '''
+key_timer.stop()
 print("DONE")
 
 #rdmaid = sid.get_request()
@@ -548,104 +552,6 @@ for batch in data_loader:
         attention_mask = batch['attention_mask']
         thor_attention_mask = data_encryptor.encode_attention_mask(attention_mask.cpu().numpy().squeeze().T, level=15)
         break
-
-'''
-print("Load and Run Plain Model:", end="")
-model_plain  = thor.utils.load_model(dataset_type, f'./finetuned_models/{dataset_type}/model.safetensors')
-model_plain.eval()
-device = torch.device("cpu")
-model_plain.to(device)
-idx = 0
-for batch in data_loader:
-    print(idx, target_idx)
-    if idx < target_idx:
-        idx += 1
-        continue
-    elif idx == target_idx:
-        batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
-        with torch.no_grad():
-            outputs = model_plain(**batch)
-        break
-
-def get_nonlinear_in_out(hidden_states, layer_idx):
-    with torch.no_grad():
-        bert_layer_m = model_plain.bert.encoder.layer[layer_idx] 
-        attention_m = bert_layer_m.attention.self
-        bert_output_m = model_plain.bert.encoder.layer[layer_idx].attention.output
-
-        q = attention_m.transpose_for_scores(attention_m.query(hidden_states))
-        k = attention_m.transpose_for_scores(attention_m.key(hidden_states))
-        v = attention_m.transpose_for_scores(attention_m.value(hidden_states))
-        attention_scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(attention_m.attention_head_size)
-        extended_att_mask = model_plain.get_extended_attention_mask(
-                        attention_mask, 768
-                    ).to(device)
-        sfmtx_in = attention_scores+extended_att_mask
-        att_probs_m = torch.nn.functional.softmax(sfmtx_in, dim=-1)
-        sfmtx_out = att_probs_m
-        att_context_m = torch.matmul(att_probs_m, v)
-        context_layer = att_context_m.permute(0, 2, 1, 3).contiguous()
-        new_context_layer_shape = context_layer.size()[:-2] + (attention_m.all_head_size,)
-        context_layer = context_layer.view(new_context_layer_shape)
-        dense_output_m = bert_output_m.dense(context_layer)
-        ln1_in = dense_output_m + hidden_states
-        ln1_out = bert_output_m.LayerNorm(ln1_in)
-        gelu_in = bert_layer_m.intermediate.dense(ln1_out)
-        gelu_out = bert_layer_m.intermediate.intermediate_act_fn(gelu_in)
-        dense2_out = bert_layer_m.output.dense(gelu_out)
-        ln2_in = dense2_out + ln1_out
-        ln2_out = bert_layer_m.output.LayerNorm(ln2_in)
-        pooler_m = model_plain.bert.pooler
-        pooler_dense_output = pooler_m.dense(ln2_out[:, 0])
-        print(ln2_out[:, 0].shape)
-        pooler_output = pooler_m.activation(pooler_dense_output)
-
-    return (
-        hidden_states.cpu().numpy().squeeze(),
-        q.cpu().numpy().squeeze(),
-        sfmtx_in.cpu().numpy().squeeze(),
-        sfmtx_out.cpu().numpy().squeeze(),
-        att_context_m.cpu().numpy().squeeze(),
-        ln1_in.cpu().numpy().squeeze(),
-        ln1_out.cpu().numpy().squeeze(),
-        gelu_in.cpu().numpy().squeeze(),
-        gelu_out.cpu().numpy().squeeze(),
-        dense2_out.cpu().numpy().squeeze(),
-        ln2_in.cpu().numpy().squeeze(),
-        ln2_out.cpu().numpy().squeeze(),
-        pooler_dense_output.cpu().numpy().squeeze(),
-        pooler_output.cpu().numpy().squeeze()
-        )
-    
-hidden_states = []
-qs= []
-ks = []
-sftmx_ins = []
-sftmx_outs = []
-att_contexts = []
-ln1_ins = []
-ln1_outs = []
-gelu_ins = []
-gelu_outs = []
-dense2_outs = []
-ln2_ins = []
-ln2_outs = []
-for layer in range(12):
-    hidden_state, q, sftmx_in, sftmx_out, att_context, ln1_in, ln1_out, gelu_in, gelu_out, dense2_out, ln2_in, ln2_out, pooler_dense_out, pooler_out = get_nonlinear_in_out(outputs.hidden_states[layer], layer)
-    hidden_states.append(hidden_state)
-    qs.append(q)
-    sftmx_ins.append(sftmx_in)
-    sftmx_outs.append(sftmx_out)
-    att_contexts.append(att_context)
-    ln1_ins.append(ln1_in)
-    ln1_outs.append(ln1_out)
-    gelu_ins.append(gelu_in)
-    gelu_outs.append(gelu_out)
-    dense2_outs.append(dense2_out)
-    ln2_ins.append(ln2_in)
-    ln2_outs.append(ln2_out)
-print("DONE")
-'''
 
 print("Load Model Weights: ", end="")
 with open(f"./encoded_models_new/{dataset_type}/att.pkl", 'rb') as f:
@@ -675,6 +581,7 @@ thor_bert.classifier = ThorBertClassifier(evaluator, classifier_weights)
 print("DONE")
 
 ct_test = None
+
 def forward_layer(x, layer_idx, thor_ff):
     global engine, evaluator, thor_attention, thor_attention_mask, time1, time2, time3, time4, time5, time6, time7, time8, time9, time10, time11, time12, time13, time14
     
@@ -819,17 +726,8 @@ def forward_layer(x, layer_idx, thor_ff):
     thor_attention.cpu()
     thor_ff.cpu()
     return ln2_out, (x, q_wo_rescale, sftmx_in, sftmx_out, att_context, ln1_in, ln1_out, gelu_in_wo_bs, gelu_out, dense2_out, ln2_in, ln2_out)
-'''
-for layer_idx in range(12):
-    print(f"Forwarding layer #{layer_idx}: ", end="")
-    
-    thor_attention = thor_bert.attentions[layer_idx]
-    thor_ff = thor_bert.ffs[layer_idx]
-    
-    x1, variables = forward_layer(x, layer_idx, thor_ff)
-    
-    print("DONE")
-'''
+
+print("NDP test")
 
 for layer_idx in range(12):
     print(f"Forwarding layer #{layer_idx}: ", end="")
@@ -840,3 +738,8 @@ for layer_idx in range(12):
     x, variables = forward_layer(x, layer_idx, thor_ff)  # ← update x each time
     
     print("DONE")
+
+total_bs_time = engine.bs_total_time()
+total_keyload_time = timer.timers["key_timer"]
+print(f"Key load time elapsed: {total_keyload_time}")
+print(f"Bootstrapping time elapsed: {total_bs_time}")

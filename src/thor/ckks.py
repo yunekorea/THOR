@@ -8,6 +8,8 @@ from liberate.fhe.bootstrapping import ckks_bootstrapping as bs
 
 from pympler import asizeof
 
+from codetiming import Timer as timer
+
 #For bootstrapping offloading to the NDP(Near-data Processing) platform
 '''
 import mmap
@@ -35,7 +37,13 @@ class CkksEngine(ckks_engine):
         self.conj_key = None
         self.fft_error = None
         self.one = None
-    
+
+        self.bs_timer = timer(name = "bootstrapping")
+
+    def bs_total_time(self):
+        total_time = timer.timers["bootstrapping"]
+        return total_time
+
     #Precomputation
     def add_pk(self, pk:DataStruct):
         self.pk = pk
@@ -81,6 +89,8 @@ class CkksEngine(ckks_engine):
     
 
     def bootstrap(self, ct):
+        print("BS Normal - ", end="")
+        self.bs_timer.start()
         for device in self.ntt.devices:
             with torch.cuda.device(device):
                 torch.cuda.empty_cache()
@@ -89,6 +99,7 @@ class CkksEngine(ckks_engine):
         for device in self.ntt.devices:
             with torch.cuda.device(device):
                 torch.cuda.empty_cache()
+        self.bs_timer.stop()
         return ct_bs
     
     #Mult

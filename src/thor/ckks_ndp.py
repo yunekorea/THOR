@@ -281,7 +281,8 @@ class CkksNDPEngine(CkksEngine):
             DataStruct: Refreshed ciphertext after bootstrapping.
         """
         # --- Pre-bootstrap GPU cache flush (mirrors parent behaviour) ---
-        print("Bootstrapping Offload: ", end="")
+        print("BS Offload - ", end="")
+        self.bs_timer.start()
         for device in self.ntt.devices:
             with torch.cuda.device(device):
                 torch.cuda.empty_cache()
@@ -295,6 +296,6 @@ class CkksNDPEngine(CkksEngine):
         for device in self.ntt.devices:
             with torch.cuda.device(device):
                 torch.cuda.empty_cache()
-        print("COMPLETE")
+        self.bs_timer.stop()
 
         return result_ct  # noqa: F821  (defined once TODO block is filled in)
