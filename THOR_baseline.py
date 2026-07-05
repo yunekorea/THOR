@@ -98,17 +98,22 @@ class LRUBootstrapKeyCache:
         self._host   = host_store          # CPU copies, never evicted
         self._gpu    = OrderedDict()       # GPU copies, LRU-ordered
         self._max    = max_gpu_keys
+        self._hits   = 0
+        self._misses = 0
 
     # ------------------------------------------------------------------
     # Core lookup – called as  bs_key[k]  by the bootstrapping internals
     # ------------------------------------------------------------------
     def __getitem__(self, key):
+        print(f"Called KEY: {key}")
         if key in self._gpu:
             # Cache hit → move to "most recently used" end
+            self._hits += 1
             self._gpu.move_to_end(key)
             return self._gpu[key]
 
         # Cache miss → load from CPU
+        self._misses += 1
         if key not in self._host:
             raise KeyError(f"Bootstrap key {key!r} not found in host store.")
 
@@ -177,6 +182,11 @@ class LRUBootstrapKeyCache:
             "max_gpu":      self._max,
             "total_keys":   len(self._host),
         }
+
+    @property
+    def hit_ratio(self):
+        total = self._hits + self._misses
+        return self._hits / total if total > 0 else 0.0
 
 
 def encode_attention_mask(engine, attention_mask:np.ndarray, level:int=15) -> np.ndarray:
@@ -444,3 +454,7 @@ total_bs_time = engine.bs_total_time()
 total_keyload_time = timer.timers["key_timer"]
 print(f"Key load time elapsed: {total_keyload_time}")
 print(f"Bootstrapping time elapsed: {total_bs_time}")
+
+print(f"LRU cache hits: {lru_cache._hits}")
+print(f"LRU cache misses: {lru_cache._misses}")
+print(f"LRU cache hit ratio: {lru_cache.hit_ratio:.4f}")
