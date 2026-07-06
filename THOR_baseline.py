@@ -105,7 +105,7 @@ class LRUBootstrapKeyCache:
     # Core lookup – called as  bs_key[k]  by the bootstrapping internals
     # ------------------------------------------------------------------
     def __getitem__(self, key):
-        print(f"Called KEY: {key}")
+        #print(f"Called KEY: {key}")
         if key in self._gpu:
             # Cache hit → move to "most recently used" end
             self._hits += 1
