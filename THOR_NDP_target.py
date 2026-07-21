@@ -37,6 +37,35 @@ if project_root not in sys.path:
 
 devices = [0]
 
+# Which bootstrap-key caching policy to use:
+#   "lru"    - LRUBootstrapKeyCache (evict least-recently-used)
+#   "belady" - BeladyBootstrapKeyCache (evict whichever key is needed
+#              farthest in the future -- optimal, since the access
+#              pattern is fully deterministic; see class docstring)
+#   "none"   - load all 55 keys straight to GPU, no paging at all
+CACHE_POLICY = "belady"
+
+# ----------------------------------------------------------------------
+# Memory diagnostics (same helper used in THOR_baseline.py)
+# ----------------------------------------------------------------------
+# torch.cuda.memory_allocated  -> bytes actually held by live tensors right now
+# torch.cuda.memory_reserved   -> bytes PyTorch's caching allocator has carved
+#                                  out of the driver (this is what nvidia-smi sees)
+# reserved - allocated         -> memory the allocator is sitting on but isn't
+#                                  using for a live tensor: fragmentation/cache
+def log_mem(tag):
+    dev = devices[0]
+    allocated = torch.cuda.memory_allocated(dev) / 1024**3
+    reserved  = torch.cuda.memory_reserved(dev) / 1024**3
+    peak      = torch.cuda.max_memory_allocated(dev) / 1024**3
+    gap       = reserved - allocated
+    print(f"[MEM] {tag:55s} | alloc={allocated:8.3f}GB | reserved={reserved:8.3f}GB "
+          f"| gap={gap:8.3f}GB | peak_alloc={peak:8.3f}GB")
+
+# Counts every serviced bootstrap request, for logging and for handing
+# BeladyBootstrapKeyCache its end_of_cycle() signal.
+_bootstrap_call_count = [0]
+
 import pickle    
 import numpy as np
 import math
@@ -183,6 +212,192 @@ class LRUBootstrapKeyCache:
             "hits":          self._hits,
             "misses":        self._misses,
             "hit_rate":      f"{hit_rate:.1%}",
+        }
+
+    def end_of_cycle(self):
+        """No-op for LRU. Exists so the driving code can call
+        cache.end_of_cycle() unconditionally regardless of policy —
+        BeladyBootstrapKeyCache uses this hook to learn the reference
+        access pattern (see that class's docstring)."""
+        pass
+
+
+class BeladyBootstrapKeyCache:
+    """
+    Belady/MIN (offline-optimal) cache for bootstrap rotation keys.
+
+    Same rationale as on the Host side: THOR's bootstrap circuit issues a
+    fixed, data-independent sequence of rotation-key lookups every single
+    call — confirmed empirically (a full trace showed 308 consecutive
+    bootstraps requesting the identical 114-key sequence, in the identical
+    order) and structurally (CKKS's CoeffToSlot/SlotToCoeff/EvalMod steps
+    cannot branch on ciphertext content — that would leak the plaintext).
+    Because the future access sequence is fully knowable, "evict whichever
+    resident key is needed farthest in the future" is provably optimal
+    here, not just a heuristic.
+
+    On this Target server, every incoming RDMA request triggers exactly
+    one engine.bootstrap() call, so "one cycle" = "one serviced request".
+    end_of_cycle() should be called once, right after the very first
+    bootstrap() call returns, to lock in the learned pattern; every
+    request after that is served under genuine Belady eviction.
+
+    Same no-write-back eviction as LRUBootstrapKeyCache above: rotation
+    keys are read-only and _host already holds the untouched, original
+    CPU copy from load time, so dropping a GPU entry needs nothing more
+    than deleting the reference.
+    """
+
+    def __init__(self, engine, host_store: dict, max_gpu_keys: int = 45):
+        self._engine = engine
+        self._host   = host_store          # permanent CPU store, never mutated
+        self._gpu    = OrderedDict()       # {key: DataStruct on GPU}; OrderedDict lets us fall back to LRU while learning
+        self._max    = max_gpu_keys
+
+        # Stats for debugging
+        self._hits   = 0
+        self._misses = 0
+
+        # Pattern-learning state
+        self._cycle     = None   # learned reference sequence (list of keys), once known
+        self._recording = []     # accumulates every key requested until end_of_cycle() is called
+        self._pos        = 0     # index into self._cycle for the *next* lookup
+
+    # ------------------------------------------------------------------
+    # Primary interface — bs.bootstrap() calls this as  bs_key[k]
+    # ------------------------------------------------------------------
+    def __getitem__(self, key):
+        if self._cycle is None:
+            self._recording.append(key)
+
+        if key in self._gpu:
+            self._hits += 1
+            if self._cycle is None:
+                self._gpu.move_to_end(key)   # keep LRU ordering fresh while still learning
+        else:
+            self._misses += 1
+            if key not in self._host:
+                raise KeyError(
+                    f"Bootstrap rotation key {key!r} was never loaded. "
+                    f"Available keys: {list(self._host.keys())}"
+                )
+
+            if len(self._gpu) >= self._max:
+                self._evict()
+
+            gpu_ds = self._engine.cuda(self._host[key])
+            self._gpu[key] = gpu_ds
+            self._gpu.move_to_end(key)
+
+        if self._cycle is not None:
+            self._pos = (self._pos + 1) % len(self._cycle)
+
+        return self._gpu[key]
+
+    def end_of_cycle(self):
+        """
+        Call once, right after the first engine.bootstrap() call returns.
+        Locks in the recorded key sequence as the reference cycle that
+        every future eviction decision will be based on. A no-op on every
+        call after the first.
+        """
+        if self._cycle is None and self._recording:
+            self._cycle = list(self._recording)
+            self._recording = None
+            self._pos = 0
+            print(f"[BeladyBootstrapKeyCache] learned a cycle of length "
+                  f"{len(self._cycle)}; switching from LRU fallback to "
+                  f"Belady/MIN eviction.")
+
+    def _next_use_distance(self, key, from_pos):
+        """Steps from from_pos (inclusive) to key's next occurrence in the
+        learned cycle, wrapping around. Every one of the 55 rotation keys
+        appears at least once per bootstrap, so this always terminates
+        well within len(cycle) steps for any key that came from this
+        cache."""
+        L = len(self._cycle)
+        for step in range(L):
+            if self._cycle[(from_pos + step) % L] == key:
+                return step
+        return L  # unreachable in practice; treat as "farthest possible"
+
+    # ------------------------------------------------------------------
+    # Membership / iteration — use CPU store so no GPU side-effects
+    # ------------------------------------------------------------------
+    def __contains__(self, key):
+        return key in self._host
+
+    def __len__(self):
+        return len(self._host)
+
+    def keys(self):
+        return self._host.keys()
+
+    def values(self):
+        raise NotImplementedError(
+            "Iterating .values() would upload all 55 keys to GPU. "
+            "Access individual keys via bs_key[k] instead."
+        )
+
+    def items(self):
+        raise NotImplementedError(
+            "Iterating .items() would upload all 55 keys to GPU. "
+            "Access individual keys via bs_key[k] instead."
+        )
+
+    # ------------------------------------------------------------------
+    # Belady/MIN eviction
+    # ------------------------------------------------------------------
+    def _evict(self):
+        if self._cycle is None:
+            # Haven't learned the pattern yet -- fall back to plain LRU,
+            # exactly like LRUBootstrapKeyCache does.
+            evict_key, evict_ds = self._gpu.popitem(last=False)
+        else:
+            # Belady/MIN: evict whichever resident key is needed farthest
+            # in the future, looking forward cyclically from the current
+            # position in the learned pattern.
+            evict_key = max(
+                self._gpu.keys(),
+                key=lambda k: self._next_use_distance(k, self._pos)
+            )
+            evict_ds = self._gpu.pop(evict_key)
+        # No write-back: _host[evict_key] already holds the untouched
+        # original CPU copy from load time (same as LRUBootstrapKeyCache).
+        del evict_ds
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def evict_all(self):
+        """Flush the entire GPU cache. Call this after bootstrapping is done."""
+        keys = list(self._gpu.keys())
+        for k in keys:
+            del self._gpu[k]
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    # ------------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------------
+    @property
+    def gpu_resident_keys(self) -> list:
+        """Keys currently on the GPU, in LRU → MRU order (meaningless once
+        Belady eviction is active, but harmless to keep for inspection)."""
+        return list(self._gpu.keys())
+
+    @property
+    def cache_stats(self) -> dict:
+        total = self._hits + self._misses
+        hit_rate = self._hits / total if total else 0.0
+        return {
+            "gpu_resident":  len(self._gpu),
+            "max_gpu":       self._max,
+            "total_keys":    len(self._host),
+            "hits":          self._hits,
+            "misses":        self._misses,
+            "hit_rate":      f"{hit_rate:.1%}",
+            "cycle_learned": self._cycle is not None,
+            "cycle_length":  len(self._cycle) if self._cycle is not None else None,
         }
 
 # Magic bytes to catch corruption / version mismatch
@@ -388,10 +603,25 @@ def key_init(engine, key_path):
         #print(f"loaded keys (CPU): {i}/{numkeys}")
 
     bs.create_cts_stc_const(engine)
+    log_mem("after create_cts_stc_const")
 
-    lru_cache = LRUBootstrapKeyCache(engine, host_store,
-                                     max_gpu_keys=45)
-    engine.add_bs_key(lru_cache)
+    if CACHE_POLICY == "lru":
+        cache = LRUBootstrapKeyCache(engine, host_store, max_gpu_keys=45)
+        engine.add_bs_key(cache)
+    elif CACHE_POLICY == "belady":
+        cache = BeladyBootstrapKeyCache(engine, host_store, max_gpu_keys=45)
+        engine.add_bs_key(cache)
+    elif CACHE_POLICY == "none":
+        print("CACHE_POLICY='none' -> loading all 55 rotation keys directly to GPU (no paging)")
+        gpu_key_dict = {}
+        for k, v in host_store.items():
+            gpu_key_dict[k] = engine.cuda(v)
+        engine.add_bs_key(gpu_key_dict)
+        cache = None
+    else:
+        raise ValueError(f"Unknown CACHE_POLICY: {CACHE_POLICY!r}")
+    log_mem("after rotation keys resident on GPU")
+    print(f"Cache policy: {CACHE_POLICY}")
     print("DONE")
 
     gc.collect()
@@ -417,6 +647,9 @@ def key_init(engine, key_path):
     del conjk
     gc.collect()
     print("DONE")
+    log_mem("after pk/evk/conjk loaded")
+
+    return cache
 
 def RDMA_init():
     dev_name = "mlx5_0".encode('utf-8')
@@ -452,7 +685,7 @@ def UDS_init():
     print("DONE")
     return server
 
-def read_ciphertext(conn, mask, cid, engine):
+def read_ciphertext(conn, mask, cid, engine, cache):
     data = conn.recv(128)
     if data:
         print("Offloading received! Processing...")
@@ -494,7 +727,27 @@ def read_ciphertext(conn, mask, cid, engine):
             #)
 
             ct = ct_deserialization(local_mr, length)
-            res_ct = engine.bootstrap(ct)
+
+            _bootstrap_call_count[0] += 1
+            n = _bootstrap_call_count[0]
+            log_mem(f"bootstrap #{n:04d} - before")
+            try:
+                res_ct = engine.bootstrap(ct)
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    print(f"\n\n=== OOM on bootstrap request #{n} ===")
+                    print(torch.cuda.memory_summary(devices[0], abbreviated=False))
+                raise
+            log_mem(f"bootstrap #{n:04d} - after ")
+
+            # Lets BeladyBootstrapKeyCache know where one bootstrap's
+            # reference sequence ends, so it can lock in the learned
+            # cycle. No-op for LRU/none, and a no-op after the first call
+            # for Belady too.
+            if cache is not None:
+                cache.end_of_cycle()
+                print(f"Cache stats: {cache.cache_stats}")
+
             new_mr , new_size = ct_serialization(res_ct, cid)
 
             print("Post SEND: ", end="")
@@ -517,22 +770,22 @@ def read_ciphertext(conn, mask, cid, engine):
     sel.unregister(conn)
     conn.close()
 
-def accept_connection(sock, mask, cid, engine):
+def accept_connection(sock, mask, cid, engine, cache):
     conn, _ = sock.accept()
     conn.setblocking(False)
     # Register the 'read' event for this specific connection
     sel.register(conn, selectors.EVENT_READ,
-                data=lambda key_obj, mask_val: read_ciphertext(key_obj.fileobj, mask_val, cid, engine))
+                data=lambda key_obj, mask_val: read_ciphertext(key_obj.fileobj, mask_val, cid, engine, cache))
 
 def main():
     #key_path = sys.argv[1]
     key_path = "/mnt/nvmf/THOR_test/THOR/keys/keys0"
     cid = RDMA_init()
     engine = engine_init()
-    key_init(engine, key_path)
+    cache = key_init(engine, key_path)
     server = UDS_init()
     sel.register(server, selectors.EVENT_READ,
-                 data=lambda key_obj, mask_val: accept_connection(key_obj.fileobj, mask_val, cid, engine))
+                 data=lambda key_obj, mask_val: accept_connection(key_obj.fileobj, mask_val, cid, engine, cache))
     print("Target is ready. Waiting for offloading events")
     try:
         while True:
@@ -542,6 +795,8 @@ def main():
                 callback(key, mask)
     except KeyboardInterrupt:
         print("Shutting down...")
+        if cache is not None:
+            print(f"Final cache stats: {cache.cache_stats}")
 
 if __name__ == '__main__':
     main()
