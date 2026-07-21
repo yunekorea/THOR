@@ -98,6 +98,8 @@ class LRUBootstrapKeyCache:
         self._host   = host_store          # CPU copies, never evicted
         self._gpu    = OrderedDict()       # GPU copies, LRU-ordered
         self._max    = max_gpu_keys
+
+        # Hit-ratio bookkeeping
         self._hits   = 0
         self._misses = 0
 
@@ -105,7 +107,7 @@ class LRUBootstrapKeyCache:
     # Core lookup – called as  bs_key[k]  by the bootstrapping internals
     # ------------------------------------------------------------------
     def __getitem__(self, key):
-        #print(f"Called KEY: {key}")
+        print(f"Called KEY: {key}")
         if key in self._gpu:
             # Cache hit → move to "most recently used" end
             self._hits += 1
@@ -215,6 +217,28 @@ with torch.cuda.device(devices[0]):
     torch.cuda.empty_cache()
     print(torch.cuda.memory_allocated(devices[0]) /1024**3)
 
+# ----------------------------------------------------------------------
+# Memory diagnostics
+# ----------------------------------------------------------------------
+# torch.cuda.memory_allocated  -> bytes actually held by live tensors right now
+# torch.cuda.memory_reserved   -> bytes PyTorch's caching allocator has carved
+#                                  out of the driver (this is what nvidia-smi sees)
+# reserved - allocated         -> memory the allocator is sitting on but isn't
+#                                  using for a live tensor: fragmentation/cache
+def log_mem(tag):
+    dev = devices[0]
+    allocated = torch.cuda.memory_allocated(dev) / 1024**3
+    reserved  = torch.cuda.memory_reserved(dev) / 1024**3
+    peak      = torch.cuda.max_memory_allocated(dev) / 1024**3
+    gap       = reserved - allocated
+    print(f"[MEM] {tag:55s} | alloc={allocated:8.3f}GB | reserved={reserved:8.3f}GB "
+          f"| gap={gap:8.3f}GB | peak_alloc={peak:8.3f}GB")
+
+# Set to False to reproduce the no-cache OOM scenario in a single script:
+# every rotation key is loaded straight to GPU and kept resident, instead of
+# being paged in/out by LRUBootstrapKeyCache.
+USE_LRU_CACHE = True
+
 params = {"logN":16, "scale_bits": 41, "num_special_primes": 4, "devices": devices, "quantum":"pre_quantum"}
 engine = CkksEngine(params)
 print("Memory allocated: ", torch.cuda.memory_allocated(devices[0]) /1024**3)
@@ -243,14 +267,41 @@ for i, key in enumerate(rotk_dict_keys, 1):
     #print(f"loaded keys (CPU): {i}/{numkeys}")
 
 bs.create_cts_stc_const(engine)
+log_mem("after create_cts_stc_const")
 
-lru_cache = LRUBootstrapKeyCache(engine, host_store,
-                                    max_gpu_keys=45)
-engine.add_bs_key(lru_cache)
+if USE_LRU_CACHE:
+    lru_cache = LRUBootstrapKeyCache(engine, host_store,
+                                        max_gpu_keys=45)
+    engine.add_bs_key(lru_cache)
+else:
+    print("USE_LRU_CACHE=False -> loading all 55 rotation keys directly to GPU (no paging)")
+    gpu_key_dict = {}
+    for k, v in host_store.items():
+        gpu_key_dict[k] = engine.cuda(v)
+    engine.add_bs_key(gpu_key_dict)
+    lru_cache = None
+log_mem("after rotation keys resident on GPU")
 #engine.add_rot_keys_from_sk(deltas, sk)
 key_timer.stop()
 print("DONE")
 print("Memory allocated: ", torch.cuda.memory_allocated(devices[0]) /1024**3)
+
+# ----------------------------------------------------------------------
+# Instrument every bootstrap() call, including ones invoked internally by
+# he_softmax / he_gelu / he_layernorm — not just the 18 explicit call sites
+# visible in forward_layer. This is a transparent wrapper: behavior is
+# unchanged, it just logs memory immediately before and after each call.
+# ----------------------------------------------------------------------
+_bootstrap_call_count = [0]
+_original_bootstrap = engine.bootstrap
+def _instrumented_bootstrap(ct):
+    _bootstrap_call_count[0] += 1
+    n = _bootstrap_call_count[0]
+    log_mem(f"bootstrap #{n:04d} - before")
+    result = _original_bootstrap(ct)
+    log_mem(f"bootstrap #{n:04d} - after ")
+    return result
+engine.bootstrap = _instrumented_bootstrap
 
 
 data_encryptor = ThorDataEncryptor(dataset_type, dataset,
@@ -306,6 +357,7 @@ def forward_layer(x, layer_idx, thor_ff):
     thor_attention.to(devices)
     thor_ff.to(devices)
     print("layer_idx:", layer_idx)
+    #log_mem(f"layer {layer_idx:02d} - after weights .to(gpu)")
     
     if x.shape == (8,):
         x_cplx = np.full((4,), None, dtype=object)
@@ -322,18 +374,22 @@ def forward_layer(x, layer_idx, thor_ff):
             x[i] =  engine.mult_scalar(engine.cc_add(x_cplx[i], conj), 1/2)
             x[i+4] =  engine.mult_scalar(engine.imult(engine.cc_sub(conj, x_cplx[i])), 1/2)
             x_cplx[i] = engine.level_up(x_cplx[i], 21)
+    #log_mem(f"layer {layer_idx:02d} - WF0 x_cplx built")
     
     # WF 1. Attention layer
     x_cplx_rots = evaluator.make_rotated_copies(x_cplx)
+    #log_mem(f"layer {layer_idx:02d} - WF1a rotated copies made")
     q_wo_rescale = thor_attention.query(x_cplx_rots)
     k = thor_attention.key(x_cplx_rots)
     v = thor_attention.value(x_cplx_rots)
+    #log_mem(f"layer {layer_idx:02d} - WF1b q/k/v computed")
 
     l_k = evaluator.transpose_upper_to_lower(k)
     l_k_cplx = np.full((4,), None, dtype=object)
     for i in range(4):
         l_k_cplx[i] = engine.cc_add(engine.level_up(l_k[i], l_k[i].level_calc+1), engine.imult(evaluator.rotate_internal(l_k[i], 64, mode='att')))
         l_k_cplx[i] = engine.rescale(l_k_cplx[i])
+    #log_mem(f"layer {layer_idx:02d} - WF1c transpose+complexify l_k")
     
     # WF 2. Attention score
     q = np.full_like(q_wo_rescale, None, dtype=object)
@@ -350,9 +406,11 @@ def forward_layer(x, layer_idx, thor_ff):
         conj = engine.conjugate(temp)
         sftmx_in[i] = engine.cc_add(temp, conj)
         sftmx_in[i+4] = engine.imult(engine.cc_sub(conj, temp))
+    #log_mem(f"layer {layer_idx:02d} - WF2 attention score + bootstrap#1 block done")
     
     # WF 3. Soft weights(Softmax)
     sftmx_out = thor_attention.softmax(x=sftmx_in, attention_mask=thor_attention_mask, rescale=False, debug=False, sk=None)
+    #log_mem(f"layer {layer_idx:02d} - WF3 softmax done")
 
     v_cplx = np.full((2,), None, dtype=object)
     for i in range(2):
@@ -368,12 +426,15 @@ def forward_layer(x, layer_idx, thor_ff):
     sftmx_out_rescale = np.full((128,), None, dtype=object)
     for j in range(128):
         sftmx_out_rescale[j] = engine.rescale(sftmx_out[j])
+    #log_mem(f"layer {layer_idx:02d} - WF3b level-matched + rescaled (128-elem sftmx_out_rescale live)")
     # WF 4. Attention head & multi-head attention
     att_context = thor_attention.calculate_attention_context(v_cplx, sftmx_out_rescale, rescale=False)
+    #log_mem(f"layer {layer_idx:02d} - WF4a attention context computed")
 
     # Bootstrap #2
     for i in range(2):
         att_context[i] = engine.bootstrap(att_context[i])
+    #log_mem(f"layer {layer_idx:02d} - WF4b bootstrap#2 done")
 
     att_context_rots = thor_attention.evaluator.make_rotated_copies(att_context)
     dense_output = thor_attention.dense(att_context_rots)
@@ -383,9 +444,11 @@ def forward_layer(x, layer_idx, thor_ff):
         x_out_sum[i] = engine.add(x[i], dense_output[i])
         x_out_sum[i+4] = engine.add(x[i+4], dense_output[i+4])
     ln1_in = x_out_sum
+    #log_mem(f"layer {layer_idx:02d} - WF4c dense output + residual add done")
 
     # WF 5. LayerNorm1
     ln1_out = thor_attention.layernorm(x=ln1_in, sk=None)
+    #log_mem(f"layer {layer_idx:02d} - WF5 layernorm1 done")
     l = np.full((64,), None,dtype=object)
     mask = np.full((engine.num_slots,), 1, dtype=int)
     mask[np.arange(engine.num_slots) % (16) >= 6] = 0
@@ -396,9 +459,11 @@ def forward_layer(x, layer_idx, thor_ff):
         for j in range(1, 16):
             index = 16*i+j
             l[index] = engine.rotate_left(l[index-1], 2**11)
+    #log_mem(f"layer {layer_idx:02d} - WF5b 64-elem 'l' array built")
 
     # WF 6. FC1(Fully Connected layer; Feed-Forward Network Part 1)
     gelu_in_wo_bs = thor_ff.dense1(l)
+    #log_mem(f"layer {layer_idx:02d} - WF6a FC1 dense1 done")
 
     for i in range(8):
         temp = engine.cc_add(gelu_in_wo_bs[0,i], engine.imult(gelu_in_wo_bs[1,i]))
@@ -408,9 +473,11 @@ def forward_layer(x, layer_idx, thor_ff):
         conj = engine.conjugate(temp)
         gelu_in_wo_bs[0,i] = engine.cc_add(temp, conj)
         gelu_in_wo_bs[1,i] = engine.imult(engine.cc_sub(conj, temp))
+    #log_mem(f"layer {layer_idx:02d} - WF6b bootstrap#3 block done (8 calls)")
 
     # WF 7. GELU(Activation Function)
     gelu_out = thor_ff.gelu(x=gelu_in_wo_bs)
+    #log_mem(f"layer {layer_idx:02d} - WF7 gelu done")
     # WF 8. FC2(Feed-Forward Network Part 2) 
     dense2_out = thor_ff.dense2(gelu_out)
     ln2_in = np.full((8,), None, dtype=object)
@@ -423,12 +490,14 @@ def forward_layer(x, layer_idx, thor_ff):
         conj = engine.conjugate(temp)
         ln2_in[i] = engine.cc_add(temp, conj)
         ln2_in[i+4] = engine.imult(engine.cc_sub(conj, temp)) 
+    #log_mem(f"layer {layer_idx:02d} - WF8 FC2 + bootstrap#4 block done")
 
     # WF 9. LayerNorm2
     if layer_idx == 9 or layer_idx == 10:
         ln2_out = thor_ff.layernorm(x=ln2_in, sk=None)
     else:
         ln2_out = thor_ff.layernorm(x=ln2_in, sk=None)
+    #log_mem(f"layer {layer_idx:02d} - WF9 layernorm2 done")
 
     if ln2_out[0].level >8:
         for i in range(8):
@@ -436,25 +505,52 @@ def forward_layer(x, layer_idx, thor_ff):
         
     thor_attention.cpu()
     thor_ff.cpu()
+    #log_mem(f"layer {layer_idx:02d} - after weights .cpu() (layer end)")
     return ln2_out, (x, q_wo_rescale, sftmx_in, sftmx_out, att_context, ln1_in, ln1_out, gelu_in_wo_bs, gelu_out, dense2_out, ln2_in, ln2_out)
 
 print("BASELINE test")
 
 for layer_idx in range(12):
     print(f"Forwarding layer #{layer_idx}: ", end="")
-    
+    torch.cuda.reset_peak_memory_stats(devices[0])
+    log_mem(f"layer {layer_idx:02d} - loop start (before .to())")
+
     thor_attention = thor_bert.attentions[layer_idx]
     thor_ff = thor_bert.ffs[layer_idx]
-    
-    x, variables = forward_layer(x, layer_idx, thor_ff)  # ← update x each time
-    
+
+    try:
+        x, variables = forward_layer(x, layer_idx, thor_ff)  # ← update x each time
+    except RuntimeError as e:
+        if "out of memory" in str(e).lower():
+            print(f"\n\n=== OOM at layer {layer_idx} ===")
+            print(torch.cuda.memory_summary(devices[0], abbreviated=False))
+        raise
+
+    log_mem(f"layer {layer_idx:02d} - after forward_layer return ('variables' still referenced)")
+
+    # DIAGNOSTIC: 'variables' (the big tuple of this layer's intermediate
+    # ciphertexts: x, q_wo_rescale, sftmx_in, sftmx_out (128 elems!),
+    # att_context, ln1_in, ln1_out, gelu_in_wo_bs, gelu_out, dense2_out,
+    # ln2_in, ln2_out) is never read anywhere in this loop. But because it's
+    # only reassigned at the TOP of the next call to forward_layer(), it
+    # stays alive in GPU memory for the entire duration of computing the
+    # *next* layer -- i.e. one full layer's worth of intermediates is held
+    # redundantly, on top of whatever the next layer is actively computing.
+    # Freeing it explicitly here shows exactly how much that is worth.
+    del variables
+    gc.collect()
+    torch.cuda.empty_cache()
+    log_mem(f"layer {layer_idx:02d} - after del(variables) + gc.collect() + empty_cache()")
+
     print("DONE")
 
 total_bs_time = engine.bs_total_time()
 total_keyload_time = timer.timers["key_timer"]
 print(f"Key load time elapsed: {total_keyload_time}")
 print(f"Bootstrapping time elapsed: {total_bs_time}")
+print(f"Total bootstrap() calls: {_bootstrap_call_count[0]}")
 
-print(f"LRU cache hits: {lru_cache._hits}")
-print(f"LRU cache misses: {lru_cache._misses}")
-print(f"LRU cache hit ratio: {lru_cache.hit_ratio:.4f}")
+if lru_cache is not None:
+    print(f"LRU cache hits: {lru_cache._hits}")
+    print(f"LRU cache misses: {lru_cache._misses}")
+    print(f"LRU cache hit ratio: {lru_cache.hit_ratio:.4f}")
