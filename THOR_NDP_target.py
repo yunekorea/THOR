@@ -606,10 +606,10 @@ def key_init(engine, key_path):
     log_mem("after create_cts_stc_const")
 
     if CACHE_POLICY == "lru":
-        cache = LRUBootstrapKeyCache(engine, host_store, max_gpu_keys=45)
+        cache = LRUBootstrapKeyCache(engine, host_store, max_gpu_keys=50)
         engine.add_bs_key(cache)
     elif CACHE_POLICY == "belady":
-        cache = BeladyBootstrapKeyCache(engine, host_store, max_gpu_keys=45)
+        cache = BeladyBootstrapKeyCache(engine, host_store, max_gpu_keys=48)
         engine.add_bs_key(cache)
     elif CACHE_POLICY == "none":
         print("CACHE_POLICY='none' -> loading all 55 rotation keys directly to GPU (no paging)")
