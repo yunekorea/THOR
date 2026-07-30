@@ -90,16 +90,16 @@ class CkksEngine(ckks_engine):
 
     def bootstrap(self, ct):
         print("BS Normal - ", end="")
-        self.bs_timer.start()
         for device in self.ntt.devices:
             with torch.cuda.device(device):
                 torch.cuda.empty_cache()
+        self.bs_timer.start()
         temp = ct
         ct_bs = bs.bootstrap(self, temp, self.bs_key, self.evk, self.conj_key, self.pk)
+        self.bs_timer.stop()
         for device in self.ntt.devices:
             with torch.cuda.device(device):
                 torch.cuda.empty_cache()
-        self.bs_timer.stop()
         return ct_bs
     
     #Mult

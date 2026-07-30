@@ -282,20 +282,22 @@ class CkksNDPEngine(CkksEngine):
         """
         # --- Pre-bootstrap GPU cache flush (mirrors parent behaviour) ---
         print("BS Offload - ", end="")
-        self.bs_timer.start()
         for device in self.ntt.devices:
             with torch.cuda.device(device):
                 torch.cuda.empty_cache()
+
+        self.bs_timer.start()
 
         mr, ct_size = self.ct_serialization(ct)
         result = self.nvme_passthru(mr)
         rmr, new_ct_size = self.receive_bs_result(ct_size)
         result_ct = self.ct_deserialization(rmr, new_ct_size)
 
+        self.bs_timer.stop()
+
         # --- Post-bootstrap GPU cache flush (mirrors parent behaviour) ---
         for device in self.ntt.devices:
             with torch.cuda.device(device):
                 torch.cuda.empty_cache()
-        self.bs_timer.stop()
 
         return result_ct  # noqa: F821  (defined once TODO block is filled in)
