@@ -6,6 +6,8 @@ from liberate.fhe import ckks_engine
 from liberate.fhe.encdec import rotate
 from liberate.fhe.bootstrapping import ckks_bootstrapping as bs
 
+from .bootstrap_profiler import bootstrap_profiler
+
 from pympler import asizeof
 
 from codetiming import Timer as timer
@@ -95,7 +97,8 @@ class CkksEngine(ckks_engine):
                 torch.cuda.empty_cache()
         self.bs_timer.start()
         temp = ct
-        ct_bs = bs.bootstrap(self, temp, self.bs_key, self.evk, self.conj_key, self.pk)
+        with bootstrap_profiler.track():
+            ct_bs = bs.bootstrap(self, temp, self.bs_key, self.evk, self.conj_key, self.pk)
         self.bs_timer.stop()
         for device in self.ntt.devices:
             with torch.cuda.device(device):

@@ -20,6 +20,7 @@ from liberate.fhe.bootstrapping import ckks_bootstrapping as bs
 
 import thor
 from thor import CkksEngine, ThorDataEncryptor, ThorLinearEvaluator
+from thor.bootstrap_profiler import bootstrap_profiler
 from thor.bert import ThorBert, ThorBertFF, ThorBertPooler, ThorBertClassifier
 from liberate.fhe.data_struct import DataStruct
 from thor.ckks_ndp import CkksNDPEngine
@@ -107,7 +108,7 @@ class LRUBootstrapKeyCache:
     # Core lookup – called as  bs_key[k]  by the bootstrapping internals
     # ------------------------------------------------------------------
     def __getitem__(self, key):
-        #print(f"Called KEY: {key}")
+        print(f"Called KEY: {key}")
         if key in self._gpu:
             # Cache hit → move to "most recently used" end
             self._hits += 1
@@ -162,7 +163,7 @@ class LRUBootstrapKeyCache:
         """Move the least-recently-used GPU key back to CPU and free VRAM."""
         lru_key, lru_tensor = self._gpu.popitem(last=False)  # FIFO end = LRU
         # Move the DataStruct's tensors back to CPU in-place
-        #self._host[lru_key] = self._engine.cpu(lru_tensor)
+        self._host[lru_key] = self._engine.cpu(lru_tensor)
         del lru_tensor
         gc.collect()
         torch.cuda.empty_cache()
@@ -431,6 +432,13 @@ CACHE_POLICY = "belady"
 params = {"logN":16, "scale_bits": 41, "num_special_primes": 4, "devices": devices, "quantum":"pre_quantum"}
 engine = CkksEngine(params)
 print("Memory allocated: ", torch.cuda.memory_allocated(devices[0]) /1024**3)
+
+# ckks.py의 CkksEngine.bootstrap() 내부, 실제 bs.bootstrap() 호출 한 줄만 정밀 계측.
+# 첫 3번의 호출만 torch.profiler로 커널 단위까지 파고들고(오버헤드 보호), 나머지는
+# 가벼운 백그라운드 샘플링(CPU/DRAM/GPU/VRAM/PCIe/디스크/RDMA)만 계속 기록합니다.
+bootstrap_profiler.start(out_dir="./profile_results/baseline",
+                          gpu_index=devices[0], ib_device="rocep59s0",
+                          detailed_profile_calls={1, 2, 3})
 
 
 print("Key Loading: ", end="")
@@ -754,3 +762,6 @@ if cache is not None:
     print(f"Cache misses: {cache._misses}")
     print(f"Cache hit ratio: {cache.hit_ratio:.4f}")
     print(f"Cache stats: {cache.cache_stats}")
+
+# 모든 forwarding(12개 레이어)이 끝난 시점 -> bootstrap 프로파일링 결과 저장.
+bootstrap_profiler.finalize()

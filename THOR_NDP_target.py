@@ -78,6 +78,7 @@ from liberate.fhe.data_struct import DataStruct
 
 import thor
 from thor import CkksEngine, ThorDataEncryptor, ThorLinearEvaluator
+from thor.bootstrap_profiler import bootstrap_profiler
 from thor.bert import ThorBert, ThorBertFF, ThorBertPooler, ThorBertClassifier
 
 import time
@@ -783,6 +784,13 @@ def main():
     cid = RDMA_init()
     engine = engine_init()
     cache = key_init(engine, key_path)
+
+    # ckks.py의 CkksEngine.bootstrap() 내부, 실제 bs.bootstrap() 호출 한 줄만 정밀 계측.
+    # baseline과 동일한 모듈/설정을 공유 -- 결과 폴더만 다르게 분리.
+    bootstrap_profiler.start(out_dir="./profile_results/ndp_target",
+                              gpu_index=devices[0], ib_device="rocep59s0",
+                              detailed_profile_calls={1, 2, 3})
+
     server = UDS_init()
     sel.register(server, selectors.EVENT_READ,
                  data=lambda key_obj, mask_val: accept_connection(key_obj.fileobj, mask_val, cid, engine, cache))
@@ -797,6 +805,8 @@ def main():
         print("Shutting down...")
         if cache is not None:
             print(f"Final cache stats: {cache.cache_stats}")
+        # 종료 명령이 들어온 시점 -> 지금까지 모은 bootstrap 프로파일링 결과 저장.
+        bootstrap_profiler.finalize()
 
 if __name__ == '__main__':
     main()
