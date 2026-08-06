@@ -107,7 +107,7 @@ class LRUBootstrapKeyCache:
     # Core lookup – called as  bs_key[k]  by the bootstrapping internals
     # ------------------------------------------------------------------
     def __getitem__(self, key):
-        print(f"Called KEY: {key}")
+        #print(f"Called KEY: {key}")
         if key in self._gpu:
             # Cache hit → move to "most recently used" end
             self._hits += 1
@@ -162,7 +162,7 @@ class LRUBootstrapKeyCache:
         """Move the least-recently-used GPU key back to CPU and free VRAM."""
         lru_key, lru_tensor = self._gpu.popitem(last=False)  # FIFO end = LRU
         # Move the DataStruct's tensors back to CPU in-place
-        self._host[lru_key] = self._engine.cpu(lru_tensor)
+        #self._host[lru_key] = self._engine.cpu(lru_tensor)
         del lru_tensor
         gc.collect()
         torch.cuda.empty_cache()
