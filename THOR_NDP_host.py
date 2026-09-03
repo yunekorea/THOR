@@ -487,7 +487,7 @@ def encode_attention_mask(engine, attention_mask:np.ndarray, level:int=15) -> np
     return attention_mask
 
 print("RDMA connecting: ", end="")
-dev_name = "rocep59s0".encode('utf-8')
+dev_name = "enp216s0np0".encode('utf-8')
 dev_name_len = len(dev_name)
 # Initialize CIMD
 cap = QPCap(max_send_wr=16, max_recv_wr=16, max_send_sge=8)

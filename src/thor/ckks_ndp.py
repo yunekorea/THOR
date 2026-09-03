@@ -195,7 +195,7 @@ class CkksNDPEngine(CkksEngine):
         return ct
 
     def nvme_passthru(self, mr):
-        dev_name = "rocep59s0".encode('utf-8')
+        dev_name = "enp216s0np0".encode('utf-8')
         dev_name_len = len(dev_name)
         metadata = {
             "rkey": mr.rkey,

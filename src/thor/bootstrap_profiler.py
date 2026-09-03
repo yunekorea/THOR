@@ -36,14 +36,14 @@ ckks.py (이미 반영됨):
 THOR_baseline.py:
     from thor.bootstrap_profiler import bootstrap_profiler
     bootstrap_profiler.start(out_dir="./profile_results/baseline",
-                              gpu_index=devices[0], ib_device="rocep59s0")
+                              gpu_index=devices[0], ib_device="enp216s0np0")
     ... (평소처럼 실행) ...
     bootstrap_profiler.finalize()   # 모든 forwarding이 끝난 뒤
 
 THOR_NDP_target.py:
     from thor.bootstrap_profiler import bootstrap_profiler
     bootstrap_profiler.start(out_dir="./profile_results/ndp_target",
-                              gpu_index=devices[0], ib_device="rocep59s0")
+                              gpu_index=devices[0], ib_device="enp216s0np0")
     ... (셀렉터 이벤트 루프) ...
     except KeyboardInterrupt:
         bootstrap_profiler.finalize()   # 종료 명령이 들어온 시점

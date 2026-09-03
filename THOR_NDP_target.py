@@ -43,7 +43,7 @@ devices = [0]
 #              farthest in the future -- optimal, since the access
 #              pattern is fully deterministic; see class docstring)
 #   "none"   - load all 55 keys straight to GPU, no paging at all
-CACHE_POLICY = "belady"
+CACHE_POLICY = "none"
 
 # ----------------------------------------------------------------------
 # Memory diagnostics (same helper used in THOR_baseline.py)
@@ -641,7 +641,6 @@ def key_init(engine, key_path):
     gc.collect()
     print("DONE")
     torch.cuda.empty_cache()
-    time.sleep(10)
     print("conjk: ", end="")
     conjk = engine.load(f"{key_path}/conjk")
     engine.add_conj_key(conjk)
@@ -788,7 +787,7 @@ def main():
     # ckks.py의 CkksEngine.bootstrap() 내부, 실제 bs.bootstrap() 호출 한 줄만 정밀 계측.
     # baseline과 동일한 모듈/설정을 공유 -- 결과 폴더만 다르게 분리.
     bootstrap_profiler.start(out_dir="./profile_results/ndp_target",
-                              gpu_index=devices[0], ib_device="rocep59s0",
+                              gpu_index=devices[0], ib_device="enp216s0np0",
                               detailed_profile_calls={1, 2, 3})
 
     server = UDS_init()

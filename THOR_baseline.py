@@ -437,7 +437,7 @@ print("Memory allocated: ", torch.cuda.memory_allocated(devices[0]) /1024**3)
 # 첫 3번의 호출만 torch.profiler로 커널 단위까지 파고들고(오버헤드 보호), 나머지는
 # 가벼운 백그라운드 샘플링(CPU/DRAM/GPU/VRAM/PCIe/디스크/RDMA)만 계속 기록합니다.
 bootstrap_profiler.start(out_dir="./profile_results/baseline",
-                          gpu_index=devices[0], ib_device="rocep59s0",
+                          gpu_index=devices[0], ib_device="enp216s0np0",
                           detailed_profile_calls={1, 2, 3})
 
 
