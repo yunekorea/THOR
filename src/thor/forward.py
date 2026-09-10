@@ -407,7 +407,7 @@ def run_forward(args):
     with timer.stage(18, "classifier"):
         x = he.stage_18_classifier(x)
 
-    dataset = load_dataset("glue", args.dataset_type)
+    dataset = load_dataset("nyu-mll/glue", args.dataset_type)
     val_set = dataset["validation"]
 
     a = he.decrypt(x[0])[0]

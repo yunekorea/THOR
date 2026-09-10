@@ -26,7 +26,7 @@ class DeltaCiphertext:
 
 
 class HE:
-    def __init__(self, device, compact, bootstrap_key_size, timer):
+    def __init__(self, device, compact, bootstrap_key_size, timer, keys_dir=None):
         self.bootstrap_key_size = bootstrap_key_size
         self.compact = compact
         self.timer = timer
@@ -34,14 +34,30 @@ class HE:
         self.mask_path = self.light_plaintext_path / "masks"
 
         self.engine = Engine(use_bootstrap_to_14_levels=True, mode="async gpu", device_id=device, compact=compact)
-        self.secret_key: SecretKey = self.engine.create_secret_key()
-        self.conjugation_key: ConjugationKey = self.engine.create_conjugation_key(self.secret_key)
-        self.relinearization_key: RelinearizationKey = self.engine.create_relinearization_key(self.secret_key)
-        self.fixed_rotation_keys: dict[int, FixedRotationKey] = dict()
 
-        self.bootstrap_key: BootstrapKey = self.engine.create_bootstrap_key(
-            self.secret_key, size=self.bootstrap_key_size
-        )
+        # keys_dir: read a key set written by generate_keys.py instead of
+        # generating one. Everything below this block is unchanged either way.
+        self.keys_dir = Path(keys_dir) if keys_dir is not None else None
+        if self.keys_dir is None:
+            self.secret_key: SecretKey = self.engine.create_secret_key()
+            self.conjugation_key: ConjugationKey = self.engine.create_conjugation_key(self.secret_key)
+            self.relinearization_key: RelinearizationKey = self.engine.create_relinearization_key(self.secret_key)
+            self.bootstrap_key: BootstrapKey = self.engine.create_bootstrap_key(
+                self.secret_key, size=self.bootstrap_key_size
+            )
+        else:
+            self.secret_key: SecretKey = self.engine.read_secret_key(str(self.keys_dir / "secret_key"))
+            self.conjugation_key: ConjugationKey = self.engine.read_conjugation_key(
+                str(self.keys_dir / "conjugation_key")
+            )
+            self.relinearization_key: RelinearizationKey = self.engine.read_relinearization_key(
+                str(self.keys_dir / "relinearization_key")
+            )
+            self.bootstrap_key: BootstrapKey = self.engine.read_bootstrap_key(
+                str(self.keys_dir / "bootstrap_key")
+            )
+
+        self.fixed_rotation_keys: dict[int, FixedRotationKey] = dict()
 
         # fmt: off
         if self.compact: # key size: medium
@@ -62,7 +78,12 @@ class HE:
             if delta in self.bootstrap_deltas or delta == 0:
                 continue
 
-            fixed_rotation_key = self.engine.create_fixed_rotation_key(self.secret_key, delta, level=level)
+            if self.keys_dir is None:
+                fixed_rotation_key = self.engine.create_fixed_rotation_key(self.secret_key, delta, level=level)
+            else:
+                fixed_rotation_key = self.engine.read_fixed_rotation_key(
+                    str(self.keys_dir / "fixed_rotation" / f"{delta}_{level}")
+                )
             self.fixed_rotation_keys[delta] = fixed_rotation_key
 
         self.rotate_levels: dict[int, int] = defaultdict(int)

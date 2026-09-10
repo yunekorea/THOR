@@ -22,7 +22,7 @@ class DataEncoder:
         self.dataset_type = dataset_type
 
         print("Loading dataset")
-        dataset = datasets.load_dataset("glue", self.dataset_type)
+        dataset = datasets.load_dataset("nyu-mll/glue", self.dataset_type)
 
         self.dataset = dataset
         del self.dataset["train"]
