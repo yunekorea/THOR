@@ -20,7 +20,6 @@ from liberate.fhe.bootstrapping import ckks_bootstrapping as bs
 
 import thor
 from thor import CkksEngine, ThorDataEncryptor, ThorLinearEvaluator
-from thor.bootstrap_profiler import bootstrap_profiler
 from thor.bert import ThorBert, ThorBertFF, ThorBertPooler, ThorBertClassifier
 from liberate.fhe.data_struct import DataStruct
 from thor.ckks_ndp import CkksNDPEngine
@@ -69,135 +68,6 @@ variables_list = []
 h_indices = [np.where(np.arange(0, 2**11) % 16 == i) for i in range(12)]
 
 key_timer = timer(name = "key_timer")
-
-class LRUBootstrapKeyCache:
-    """
-    A dict-like wrapper that keeps at most `max_gpu_keys` bootstrap rotation
-    keys on the GPU at once.  All 55 keys live on the CPU (host_store); the
-    GPU cache is managed with an LRU policy.
-
-    The bootstrapping code does  bs_key[rotation_index]  — this class
-    intercepts that lookup, moves the key to GPU on demand, and evicts the
-    least-recently-used key back to CPU when the cache is full.
-
-    Usage
-    -----
-        cache = LRUBootstrapKeyCache(engine, host_store, max_gpu_keys=4)
-        engine.add_bs_key(cache)           # replaces the old rotk_dict
-    """
-
-    def __init__(self, engine, host_store: dict, max_gpu_keys: int = 4):
-        """
-        Parameters
-        ----------
-        engine        : the CKKS engine (needs a .cuda() method for host→GPU)
-        host_store    : dict  {rotation_key: DataStruct on CPU}
-        max_gpu_keys  : how many keys to keep resident on the GPU at once.
-                        Keep this small enough to avoid OOM.
-        """
-        self._engine = engine
-        self._host   = host_store          # CPU copies, never evicted
-        self._gpu    = OrderedDict()       # GPU copies, LRU-ordered
-        self._max    = max_gpu_keys
-
-        # Hit-ratio bookkeeping
-        self._hits   = 0
-        self._misses = 0
-
-    # ------------------------------------------------------------------
-    # Core lookup – called as  bs_key[k]  by the bootstrapping internals
-    # ------------------------------------------------------------------
-    def __getitem__(self, key):
-        print(f"Called KEY: {key}")
-        if key in self._gpu:
-            # Cache hit → move to "most recently used" end
-            self._hits += 1
-            self._gpu.move_to_end(key)
-            return self._gpu[key]
-
-        # Cache miss → load from CPU
-        self._misses += 1
-        if key not in self._host:
-            raise KeyError(f"Bootstrap key {key!r} not found in host store.")
-
-        # Evict LRU key if we are at capacity
-        if len(self._gpu) >= self._max:
-            self._evict_lru()
-
-        # Move key from CPU → GPU
-        gpu_key = self._engine.cuda(self._host[key])
-        self._gpu[key] = gpu_key
-        self._gpu.move_to_end(key)         # mark as MRU
-        return gpu_key
-
-    # ------------------------------------------------------------------
-    # Pass-through helpers so the bootstrapping code can iterate / test
-    # membership without triggering GPU loads
-    # ------------------------------------------------------------------
-    def __contains__(self, key):
-        return key in self._host           # logical membership = all keys
-
-    def __len__(self):
-        return len(self._host)
-
-    def keys(self):
-        return self._host.keys()
-
-    def values(self):
-        # Iterating values would page everything onto the GPU – warn loudly.
-        raise NotImplementedError(
-            "Iterating .values() would move all keys to GPU. "
-            "Use explicit key lookups instead."
-        )
-
-    def items(self):
-        raise NotImplementedError(
-            "Iterating .items() would move all keys to GPU. "
-            "Use explicit key lookups instead."
-        )
-
-    # ------------------------------------------------------------------
-    # Cache management
-    # ------------------------------------------------------------------
-    def _evict_lru(self):
-        """Move the least-recently-used GPU key back to CPU and free VRAM."""
-        lru_key, lru_tensor = self._gpu.popitem(last=False)  # FIFO end = LRU
-        # Move the DataStruct's tensors back to CPU in-place
-        self._host[lru_key] = self._engine.cpu(lru_tensor)
-        del lru_tensor
-        gc.collect()
-        torch.cuda.empty_cache()
-
-    def evict_all(self):
-        """Push every cached GPU key back to CPU.  Call after bootstrapping."""
-        while self._gpu:
-            self._evict_lru()
-
-    @property
-    def gpu_resident_keys(self):
-        """Which keys are currently on the GPU (for debugging)."""
-        return list(self._gpu.keys())
-
-    @property
-    def cache_stats(self):
-        return {
-            "gpu_resident": len(self._gpu),
-            "max_gpu":      self._max,
-            "total_keys":   len(self._host),
-        }
-
-    @property
-    def hit_ratio(self):
-        total = self._hits + self._misses
-        return self._hits / total if total > 0 else 0.0
-
-    def end_of_cycle(self):
-        """No-op for LRU. Exists so the driving code can call
-        cache.end_of_cycle() unconditionally regardless of which policy
-        is active (BeladyBootstrapKeyCache uses this hook to learn the
-        reference access pattern)."""
-        pass
-
 
 class BeladyBootstrapKeyCache:
     """
@@ -432,14 +302,6 @@ CACHE_POLICY = "belady"
 params = {"logN":16, "scale_bits": 41, "num_special_primes": 4, "devices": devices, "quantum":"pre_quantum"}
 engine = CkksEngine(params)
 print("Memory allocated: ", torch.cuda.memory_allocated(devices[0]) /1024**3)
-
-# ckks.py의 CkksEngine.bootstrap() 내부, 실제 bs.bootstrap() 호출 한 줄만 정밀 계측.
-# 첫 3번의 호출만 torch.profiler로 커널 단위까지 파고들고(오버헤드 보호), 나머지는
-# 가벼운 백그라운드 샘플링(CPU/DRAM/GPU/VRAM/PCIe/디스크/RDMA)만 계속 기록합니다.
-bootstrap_profiler.start(out_dir="./profile_results/baseline",
-                          gpu_index=devices[0], ib_device="rocep59s0",
-                          detailed_profile_calls={1, 2, 3})
-
 
 print("Key Loading: ", end="")
 key_timer.start()
@@ -763,5 +625,3 @@ if cache is not None:
     print(f"Cache hit ratio: {cache.hit_ratio:.4f}")
     print(f"Cache stats: {cache.cache_stats}")
 
-# 모든 forwarding(12개 레이어)이 끝난 시점 -> bootstrap 프로파일링 결과 저장.
-bootstrap_profiler.finalize()
