@@ -1,1 +1,5 @@
 *.sh
+src/thor/__pycache__/
+keys_desilo/
+finetuned_models/
+poetry.lock
