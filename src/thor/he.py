@@ -26,14 +26,24 @@ class DeltaCiphertext:
 
 
 class HE:
-    def __init__(self, device, compact, bootstrap_key_size, timer, keys_dir=None):
+    def __init__(self, device, compact, bootstrap_key_size, timer, keys_dir=None, mode="async gpu"):
         self.bootstrap_key_size = bootstrap_key_size
         self.compact = compact
         self.timer = timer
         self.light_plaintext_path = get_light_plaintext_path(compact)
         self.mask_path = self.light_plaintext_path / "masks"
 
-        self.engine = Engine(use_bootstrap_to_14_levels=True, mode="async gpu", device_id=device, compact=compact)
+        # mode: "async gpu" (default, fastest), "gpu", "parallel" (multi-threaded
+        # CPU) or "cpu". The docs warn against sharing data structures created by
+        # an "async gpu" engine with another engine, which matters for the NDP
+        # split -- see he_ndp.py.
+        self.mode = mode
+        if mode in ("gpu", "async gpu"):
+            self.engine = Engine(
+                use_bootstrap_to_14_levels=True, mode=mode, device_id=device, compact=compact
+            )
+        else:
+            self.engine = Engine(use_bootstrap_to_14_levels=True, mode=mode, compact=compact)
 
         # keys_dir: read a key set written by generate_keys.py instead of
         # generating one. Everything below this block is unchanged either way.
@@ -42,9 +52,14 @@ class HE:
             self.secret_key: SecretKey = self.engine.create_secret_key()
             self.conjugation_key: ConjugationKey = self.engine.create_conjugation_key(self.secret_key)
             self.relinearization_key: RelinearizationKey = self.engine.create_relinearization_key(self.secret_key)
-            self.bootstrap_key: BootstrapKey = self.engine.create_bootstrap_key(
-                self.secret_key, size=self.bootstrap_key_size
-            )
+            # HENDP sets _skip_bootstrap_key: when bootstrapping is offloaded the
+            # host never uses this key, and it is the largest single allocation.
+            if not getattr(self, "_skip_bootstrap_key", False):
+                self.bootstrap_key: BootstrapKey = self.engine.create_bootstrap_key(
+                    self.secret_key, size=self.bootstrap_key_size
+                )
+            else:
+                self.bootstrap_key = None
         else:
             self.secret_key: SecretKey = self.engine.read_secret_key(str(self.keys_dir / "secret_key"))
             self.conjugation_key: ConjugationKey = self.engine.read_conjugation_key(
@@ -53,9 +68,12 @@ class HE:
             self.relinearization_key: RelinearizationKey = self.engine.read_relinearization_key(
                 str(self.keys_dir / "relinearization_key")
             )
-            self.bootstrap_key: BootstrapKey = self.engine.read_bootstrap_key(
-                str(self.keys_dir / "bootstrap_key")
-            )
+            if not getattr(self, "_skip_bootstrap_key", False):
+                self.bootstrap_key: BootstrapKey = self.engine.read_bootstrap_key(
+                    str(self.keys_dir / "bootstrap_key")
+                )
+            else:
+                self.bootstrap_key = None
 
         self.fixed_rotation_keys: dict[int, FixedRotationKey] = dict()
 
