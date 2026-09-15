@@ -97,11 +97,17 @@ def main():
         compact=args.compact,
     )
 
+    sizes = {}
+
     def emit(label, key, writer, path):
         t0 = time.perf_counter()
         writer(key, str(path))
-        print(f"  {label:22s} {path.stat().st_size / 1024**2:9.1f} MiB "
-              f"{time.perf_counter() - t0:7.2f}s")
+        write_seconds = time.perf_counter() - t0
+        resident = getattr(key, "nbytes", 0) / 1024**2
+        on_disk = path.stat().st_size / 1024**2
+        sizes[label] = dict(resident_mib=round(resident, 1), on_disk_mib=round(on_disk, 1))
+        print(f"  {label:22s} resident {resident:9.1f} MiB | "
+              f"on disk {on_disk:9.1f} MiB | {write_seconds:6.2f}s")
 
     secret_key = engine.create_secret_key()
     emit("secret_key", secret_key, engine.write_secret_key, keydir / "secret_key")
@@ -122,6 +128,23 @@ def main():
     bootstrap_key = engine.create_bootstrap_key(secret_key, size=key_size)
     emit("bootstrap_key", bootstrap_key, engine.write_bootstrap_key,
          keydir / "bootstrap_key")
+
+    # General rotation key: rotates by ANY delta with a single key
+    # (engine.rotate(ct, rotation_key, delta)).
+    #
+    # THOR normally rotates the 52 bootstrap deltas using the BOOTSTRAP key,
+    # which desilofhe also accepts as a rotation key -- fine on one machine,
+    # but it pins the largest object in the system to whoever does the
+    # rotating. For the NDP split the host needs those rotations without the
+    # bootstrap key, and this is the small way to get them.
+    #
+    # Compare the two "resident" numbers printed below: that difference is the
+    # data the NDP target no longer has to ship to the host.
+    t0 = time.perf_counter()
+    rotation_key = engine.create_rotation_key(secret_key)
+    print(f"  {'rotation_key':22s} (created in {time.perf_counter() - t0:.1f}s)")
+    emit("rotation_key", rotation_key, engine.write_rotation_key,
+         keydir / "rotation_key")
 
     # Fixed rotation keys. Deltas covered by the bootstrap key are skipped,
     # exactly as HE.__init__ does -- generating them would waste time and disk.
@@ -153,10 +176,20 @@ def main():
         build_hash=str(engine.build_hash),
         rotation_key_count=len(rotation_keys),
         rotation_keys=[list(r) for r in rotation_keys],
+        key_sizes=sizes,
     ), indent=2) + "\n")
 
     total_bytes = sum(f.stat().st_size for f in keydir.rglob("*") if f.is_file())
     print()
+    bs = sizes.get("bootstrap_key", {}).get("resident_mib", 0)
+    rot = sizes.get("rotation_key", {}).get("resident_mib", 0)
+    if bs and rot:
+        print("Host-side key options for the bootstrap deltas:")
+        print(f"  bootstrap_key : {bs / 1024:8.2f} GiB resident  (what THOR uses by default)")
+        print(f"  rotation_key  : {rot / 1024:8.2f} GiB resident  (equivalent for rotation only)")
+        print(f"  difference    : {(bs - rot) / 1024:8.2f} GiB "
+              f"({bs / rot:.1f}x smaller)")
+        print()
     print(f"Done in {time.perf_counter() - started:.1f}s")
     print(f"  {5 + len(rotation_keys)} keys, {total_bytes / 1024**3:.2f} GiB "
           f"in {keydir.resolve()}")
