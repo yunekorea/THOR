@@ -53,6 +53,55 @@ from thor.he import HE
 from thor.timer import Timer
 
 
+class BootstrapTimer:
+    """Times every HE.bootstrap() call, for comparison against the NDP host.
+
+    Patched onto the INSTANCE, not the class: he.py calls `self.bootstrap(...)`
+    internally from he_inv, he_invsqrt, stage_07_softmax and stage_13, and Python
+    resolves that through the instance dict first -- so this catches the internal
+    calls too, not just any visible in forward_layer. HENDP.bootstrap overrides
+    the same method to ship the ciphertext to the target, so the `bootstrap_calls`
+    and `bootstrap_seconds` reported here line up with its report() fields.
+    """
+
+    def __init__(self, he):
+        self.calls = 0
+        self.seconds = 0.0
+        self.per_layer = {}
+        self._layer = None
+        self._orig = he.bootstrap
+        he.bootstrap = self._call
+
+    def set_layer(self, layer):
+        self._layer = layer
+
+    def _call(self, ciphertext):
+        self.calls += 1
+        t0 = time.perf_counter()
+        out = self._orig(ciphertext)
+        dt = time.perf_counter() - t0
+        self.seconds += dt
+        if self._layer is not None:
+            rec = self.per_layer.setdefault(self._layer, {"calls": 0, "seconds": 0.0})
+            rec["calls"] += 1
+            rec["seconds"] += dt
+        return out
+
+    def report(self):
+        return dict(
+            bootstrap_calls=self.calls,
+            bootstrap_seconds=round(self.seconds, 3),
+            bootstrap_mean_seconds=round(self.seconds / self.calls, 3) if self.calls else 0.0,
+            # keys are the 12 int layer indices plus the string "head"; a bare
+            # sorted() raises TypeError on the mixed types.
+            bootstrap_per_layer={
+                str(k): {"calls": v["calls"], "seconds": round(v["seconds"], 3)}
+                for k, v in sorted(self.per_layer.items(),
+                                   key=lambda kv: (isinstance(kv[0], str), kv[0]))
+            },
+        )
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Run the THOR encrypted forward pass (no plain reference, no plots)."
@@ -110,6 +159,8 @@ def main():
         he = HE(args.device, args.compact, key_size, timer, keys_dir=keys_dir)
         print(f"  keys ready ({time.perf_counter() - t0:.1f}s)")
 
+        bootstrap_timer = BootstrapTimer(he)
+
         print("Encrypting input")
         t0 = time.perf_counter()
         _, x, _, _, clear_attention_mask = load_encrypted_input(
@@ -121,6 +172,7 @@ def main():
     layer_seconds = []
     for layer_idx in range(12):
         print(f"Forwarding layer #{layer_idx}")
+        bootstrap_timer.set_layer(layer_idx)
         t0 = time.perf_counter()
         with timer.layer(layer_idx):
             x, variables = forward_layer(x, layer_idx, clear_attention_mask, he)
@@ -133,6 +185,7 @@ def main():
     timer.print_legend()
 
     # ---- 3. Run pooler and classification -----------------------------------
+    bootstrap_timer.set_layer("head")
     print("Running pooler")
     t0 = time.perf_counter()
     with timer.stage(17, "pooler"):
@@ -155,10 +208,16 @@ def main():
         for delta, level in he.rotate_levels.items():
             print(f"Rotate delta {delta} max level {level}")
 
+    bs = bootstrap_timer.report()
     print()
     print(f"Total wall time: {total:.1f}s "
           f"(12 layers: {sum(layer_seconds):.1f}s, "
           f"pooler+classifier: {pooler_seconds + classifier_seconds:.1f}s)")
+    print(f"Bootstraps (local)   : {bs['bootstrap_calls']}")
+    print(f"  total time         : {bs['bootstrap_seconds']:.1f}s "
+          f"({bs['bootstrap_mean_seconds']:.2f}s each)")
+    if total:
+        print(f"  share of wall time : {100 * bs['bootstrap_seconds'] / total:.1f}%")
 
     (output_dir / "baseline_result.json").write_text(json.dumps(dict(
         dataset_type=args.dataset_type,
@@ -172,6 +231,7 @@ def main():
         layer_seconds=layer_seconds,
         pooler_seconds=round(pooler_seconds, 3),
         classifier_seconds=round(classifier_seconds, 3),
+        **bs,
     ), indent=2) + "\n")
     print(f"Wrote {output_dir / 'baseline_result.json'}")
 
