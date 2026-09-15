@@ -13,6 +13,15 @@ Start the target first, then:
     poetry run python THOR_NDP_host.py --transport rdma
 """
 
+import os, sys
+project_root = os.path.abspath(os.path.join(os.getcwd(), './src'))
+if project_root not in sys.path:
+    sys.path.append(project_root)
+    
+project_root = os.path.abspath(os.path.join(os.getcwd(), '../src'))
+if project_root not in sys.path:
+    sys.path.append(project_root)
+
 import argparse
 import json
 import time
