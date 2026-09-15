@@ -10,6 +10,7 @@ from desilofhe import (
     FixedRotationKey,
     Plaintext,
     RelinearizationKey,
+    RotationKey,
     SecretKey,
 )
 
@@ -26,7 +27,8 @@ class DeltaCiphertext:
 
 
 class HE:
-    def __init__(self, device, compact, bootstrap_key_size, timer, keys_dir=None, mode="async gpu"):
+    def __init__(self, device, compact, bootstrap_key_size, timer, keys_dir=None,
+                 mode="async gpu", use_rotation_key=False):
         self.bootstrap_key_size = bootstrap_key_size
         self.compact = compact
         self.timer = timer
@@ -38,6 +40,12 @@ class HE:
         # an "async gpu" engine with another engine, which matters for the NDP
         # split -- see he_ndp.py.
         self.mode = mode
+        # use_rotation_key: serve the bootstrap-delta rotations from a general
+        # RotationKey instead of the bootstrap key. Same rotations either way --
+        # see rotate() -- but it lets the NDP host drop the bootstrap key, which
+        # is the single largest object in the system.
+        self.use_rotation_key = use_rotation_key
+        self.rotation_key: RotationKey | None = None
         if mode in ("gpu", "async gpu"):
             self.engine = Engine(
                 use_bootstrap_to_14_levels=True, mode=mode, device_id=device, compact=compact
@@ -60,6 +68,8 @@ class HE:
                 )
             else:
                 self.bootstrap_key = None
+            if self.use_rotation_key:
+                self.rotation_key = self.engine.create_rotation_key(self.secret_key)
         else:
             self.secret_key: SecretKey = self.engine.read_secret_key(str(self.keys_dir / "secret_key"))
             self.conjugation_key: ConjugationKey = self.engine.read_conjugation_key(
@@ -74,6 +84,14 @@ class HE:
                 )
             else:
                 self.bootstrap_key = None
+            if self.use_rotation_key:
+                rotation_key_path = self.keys_dir / "rotation_key"
+                if not rotation_key_path.exists():
+                    raise FileNotFoundError(
+                        f"{rotation_key_path} not found. Regenerate the key set with "
+                        f"generate_keys.py, which now emits a rotation_key."
+                    )
+                self.rotation_key = self.engine.read_rotation_key(str(rotation_key_path))
 
         self.fixed_rotation_keys: dict[int, FixedRotationKey] = dict()
 
@@ -196,9 +214,20 @@ class HE:
         self.rotate_levels[normalized_delta] = max(self.rotate_levels[normalized_delta], ciphertext.level)
         if normalized_delta == 0:
             rotated = self.engine.clone(ciphertext)
-        elif normalized_delta in self.bootstrap_deltas:
-            rotated = self.engine.rotate(ciphertext, self.bootstrap_key, normalized_delta)
+        elif normalized_delta in self.bootstrap_deltas and (
+            self.rotation_key is not None or self.bootstrap_key is not None
+        ):
+            # These 20-odd deltas are ordinary forward-pass rotations; __init__
+            # builds no fixed rotation keys for them because the bootstrap key
+            # already contains rotation keys for the whole bootstrap_deltas set.
+            # A general RotationKey serves them identically and is far smaller,
+            # so prefer it when one is resident. Both desilofhe overloads take
+            # (ciphertext, key, delta), so the call is the same either way.
+            key = self.rotation_key if self.rotation_key is not None else self.bootstrap_key
+            rotated = self.engine.rotate(ciphertext, key, normalized_delta)
         else:
+            # Reached either for a non-bootstrap delta, or for a bootstrap delta
+            # when no bootstrap key is resident (NDP host with --skip-bootstrap-key).
             if normalized_delta not in self.fixed_rotation_keys:
                 level = ciphertext.level
                 print(f"\tADDING FIXED ROTATION KEY FOR {normalized_delta} LEVEL {level}")

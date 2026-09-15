@@ -207,17 +207,24 @@ class RdmaNvmeTransport:
 class HENDP(HE):
     """HE whose bootstrap() runs on the NDP target instead of locally.
 
-    The host therefore never needs a bootstrap key: that is the whole point of
-    the split, and it is where the VRAM saving comes from. Pass
-    skip_bootstrap_key=True and the constructor leaves it unset.
+    The host loads a general RotationKey instead of the bootstrap key. THOR uses
+    the bootstrap key as a ROTATION key for the ~20 forward-pass deltas that fall
+    inside bootstrap_deltas (see HE.rotate) -- those rotations are ordinary layer
+    work, not bootstrapping, and a RotationKey serves them identically at a
+    fraction of the size. This is the direct analogue of the Liberate split, where
+    the host loaded the Galois key `gk` and left `rotk_dict` on the target.
+
+    Set skip_bootstrap_key=False to load the bootstrap key locally as well, for
+    A/B runs against local bootstrapping.
     """
 
     def __init__(self, device, compact, bootstrap_key_size, timer,
                  keys_dir=None, mode="gpu", transport=None,
-                 skip_bootstrap_key=True, verbose=True):
+                 skip_bootstrap_key=True, use_rotation_key=True, verbose=True):
         self._skip_bootstrap_key = skip_bootstrap_key
         super().__init__(device, compact, bootstrap_key_size, timer,
-                         keys_dir=keys_dir, mode=mode)
+                         keys_dir=keys_dir, mode=mode,
+                         use_rotation_key=use_rotation_key)
         self.transport = transport
         self.verbose = verbose
         self.bootstrap_calls = 0

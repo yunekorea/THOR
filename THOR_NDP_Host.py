@@ -54,8 +54,14 @@ def parse_args():
     p.add_argument("--nvme-dev", default="nvme1n1", help="RDMA transport only.")
     p.add_argument("--ib-dev", default="enp216s0np0", help="RDMA transport only.")
     p.add_argument("--load-bootstrap-key", action="store_true",
-                   help="Also load the bootstrap key locally. Only useful to A/B "
-                        "local vs offloaded bootstrapping; wastes VRAM otherwise.")
+                   help="Also load the bootstrap key on the host. Not needed: the "
+                        "rotation_key covers the bootstrap-delta rotations. Use "
+                        "only to A/B against local bootstrapping.")
+    p.add_argument("--no-rotation-key", dest="use_rotation_key",
+                   action="store_false", default=True,
+                   help="Do not load the general rotation key. Implies you must "
+                        "pass --load-bootstrap-key, since something has to serve "
+                        "the bootstrap-delta rotations.")
     return p.parse_args()
 
 
@@ -74,6 +80,10 @@ def main():
         raise SystemExit(f"{keys_dir} built with compact={params.get('compact')}, "
                          f"run uses compact={args.compact}.")
 
+    if not args.use_rotation_key and not args.load_bootstrap_key:
+        raise SystemExit("--no-rotation-key needs --load-bootstrap-key: something "
+                         "must serve the bootstrap-delta rotations.")
+
     print(f"Connecting to target via {args.transport}")
     transport = make_transport(args.transport, args)
     print("  connected")
@@ -86,9 +96,12 @@ def main():
         t0 = time.perf_counter()
         he = HENDP(args.device, args.compact, key_size, timer,
                    keys_dir=keys_dir, mode=args.mode, transport=transport,
-                   skip_bootstrap_key=not args.load_bootstrap_key)
-        print(f"  keys ready ({time.perf_counter() - t0:.1f}s"
-              f"{', bootstrap key NOT loaded' if not args.load_bootstrap_key else ''})")
+                   skip_bootstrap_key=not args.load_bootstrap_key,
+                   use_rotation_key=args.use_rotation_key)
+        resident = "rotation_key" if args.use_rotation_key else "bootstrap_key"
+        print(f"  keys ready ({time.perf_counter() - t0:.1f}s, rotations served by "
+              f"{resident}"
+              f"{'' if args.load_bootstrap_key else ', bootstrap key NOT loaded'})")
 
         print("Encrypting input")
         t0 = time.perf_counter()
