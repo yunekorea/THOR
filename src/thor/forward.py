@@ -38,11 +38,12 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_encrypted_input(dataset_type, target_idx, he):
+def load_encrypted_input(dataset_type, target_idx, he, dataset_path=""):
     data_encryptor = DataEncoder(
         dataset_type,
         embedding_model=BertForNextSentencePrediction.from_pretrained("bert-base-uncased").bert.embeddings,
         he=he,
+        dataset_path=dataset_path,
     )
     data_loader = data_encryptor.eval_dataloader
 

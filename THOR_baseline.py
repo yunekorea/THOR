@@ -69,6 +69,8 @@ def parse_args():
     parser.add_argument("--no-load-keys", dest="load_keys", action="store_false",
                         default=True,
                         help="Generate keys in-process instead of reading them.")
+    parser.add_argument("--dataset-path", default="",
+                        help="Load the dataset from a save_to_disk snapshot instead of the HuggingFace Hub, e.g. ./datasets/mrpc. Use this to run against the same samples as the Liberate results.")
     parser.add_argument("--output-dir", default="./baseline_results")
     parser.add_argument("--print-rotate-levels", action="store_true")
     return parser.parse_args()
@@ -111,7 +113,7 @@ def main():
         print("Encrypting input")
         t0 = time.perf_counter()
         _, x, _, _, clear_attention_mask = load_encrypted_input(
-            args.dataset_type, args.target_idx, he
+            args.dataset_type, args.target_idx, he, dataset_path=args.dataset_path
         )
         print(f"  input encrypted ({time.perf_counter() - t0:.1f}s)")
 
@@ -160,6 +162,7 @@ def main():
 
     (output_dir / "baseline_result.json").write_text(json.dumps(dict(
         dataset_type=args.dataset_type,
+        dataset_path=args.dataset_path or None,
         target_idx=args.target_idx,
         device=args.device,
         compact=args.compact,

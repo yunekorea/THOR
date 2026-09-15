@@ -40,6 +40,8 @@ def parse_args():
     p.add_argument("--device", type=int, default=0, help="CUDA device index.")
     p.add_argument("--compact", action="store_true")
     p.add_argument("--keys-dir", default=None)
+    p.add_argument("--dataset-path", default="",
+                   help="Load the dataset from a save_to_disk snapshot instead of the HuggingFace Hub, e.g. ./datasets/mrpc. Use this to run against the same samples as the Liberate results.")
     p.add_argument("--output-dir", default="./ndp_host_results")
     p.add_argument("--mode", default="gpu", choices=["gpu", "async gpu"],
                    help="Host engine mode. Defaults to 'gpu', not 'async gpu': "
@@ -91,7 +93,7 @@ def main():
         print("Encrypting input")
         t0 = time.perf_counter()
         _, x, _, _, clear_attention_mask = load_encrypted_input(
-            args.dataset_type, args.target_idx, he
+            args.dataset_type, args.target_idx, he, dataset_path=args.dataset_path
         )
         print(f"  input encrypted ({time.perf_counter() - t0:.1f}s)")
 
@@ -138,7 +140,8 @@ def main():
           f"{bs['mib_received']:.0f} MiB back")
 
     (output_dir / "ndp_host_result.json").write_text(json.dumps(dict(
-        dataset_type=args.dataset_type, target_idx=args.target_idx,
+        dataset_type=args.dataset_type, dataset_path=args.dataset_path or None,
+        target_idx=args.target_idx,
         compact=args.compact, key_size=key_size, mode=args.mode,
         transport=args.transport, keys_dir=str(keys_dir),
         total_seconds=round(total, 3), layer_seconds=layer_seconds,

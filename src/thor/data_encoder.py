@@ -13,6 +13,7 @@ class DataEncoder:
         dataset_type: str,
         embedding_model: torch.nn.Module = None,
         he=None,
+        dataset_path: str = "",
     ):
         self.checkpoint = "bert-base-uncased"
 
@@ -21,8 +22,16 @@ class DataEncoder:
             raise ValueError("Invalid dataset type")
         self.dataset_type = dataset_type
 
-        print("Loading dataset")
-        dataset = datasets.load_dataset("nyu-mll/glue", self.dataset_type)
+        # dataset_path restores the Liberate ThorDataEncryptor behaviour: read a
+        # snapshot saved with save_to_disk instead of pulling from the Hub. Use it
+        # to run against exactly the sample set the Liberate results were produced
+        # from -- and to keep the host off the network entirely.
+        if dataset_path:
+            print(f"Loading dataset from disk: {dataset_path}")
+            dataset = datasets.load_from_disk(dataset_path)
+        else:
+            print("Loading dataset")
+            dataset = datasets.load_dataset("nyu-mll/glue", self.dataset_type)
 
         self.dataset = dataset
         del self.dataset["train"]
