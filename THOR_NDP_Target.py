@@ -4,12 +4,14 @@ THOR_NDP_target.py -- bootstrap service running on a CPU desilofhe engine.
 
 Ported from the Liberate THOR_NDP_target.py. Three things changed:
 
-1. The engine is a CPU engine. Desilo documents four modes; the two that run
-   without a GPU are "cpu" (single-threaded) and "parallel" (multi-threaded,
-   4 threads by default, settable via thread_count). Use "parallel" -- CPU
-   bootstrapping is slow enough that threads matter. Both build the same ring
-   as the host's GPU engine: Engine(use_bootstrap_to_14_levels=True) gives
-   slot_count=32768 and max_level=14 either way (confirmed on desilofhe 1.16).
+1. The engine mode is selectable with --mode. Desilo offers four: "cpu"
+   (single-threaded) and "parallel" (multi-threaded, 4 threads by default,
+   settable via thread_count) run without a GPU; "gpu" and "async gpu" use
+   CUDA and take a device_id. Default is "parallel" -- CPU bootstrapping is
+   slow enough that threads matter. All four build the same ring as the host:
+   Engine(use_bootstrap_to_14_levels=True) gives slot_count=32768 and
+   max_level=14 regardless of mode (confirmed on desilofhe 1.16), so the same
+   key set loads into any of them.
 
 2. Keys are read, not loaded-and-paged. The LRU/Belady rotation-key caches from
    the Liberate target are gone: bootstrap deltas are fused into one opaque
@@ -22,18 +24,10 @@ Ported from the Liberate THOR_NDP_target.py. Three things changed:
    hand-rolled DataStruct walk, so this file no longer needs to know anything
    about tensor layout.
 
-    poetry run python THOR_NDP_target.py --transport tcp --threads 64
-    poetry run python THOR_NDP_target.py --transport rdma
+    poetry run python THOR_NDP_target.py --transport tcp --mode parallel --threads 64
+    poetry run python THOR_NDP_target.py --transport rdma --mode gpu --device 0
+    poetry run python THOR_NDP_target.py --transport rdma --mode async_gpu
 """
-
-import os, sys
-project_root = os.path.abspath(os.path.join(os.getcwd(), './src'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
-    
-project_root = os.path.abspath(os.path.join(os.getcwd(), '../src'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
 
 import argparse
 import json
@@ -47,16 +41,25 @@ from thor.he_ndp import MAX_CT_BYTES, frame, unframe
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="THOR NDP bootstrap target (CPU engine).")
+    p = argparse.ArgumentParser(description="THOR NDP bootstrap target.")
     p.add_argument("--keys-dir", default=None,
                    help="Key set from generate_keys.py. MUST be the same set the "
                         "host uses, or bootstrapping returns garbage.")
     p.add_argument("--compact", action="store_true",
                    help="Must match the host.")
-    p.add_argument("--mode", default="parallel", choices=["parallel", "cpu"],
-                   help="'parallel' is multi-threaded CPU; 'cpu' is single-threaded.")
+    p.add_argument("--mode", default="parallel",
+                   choices=["cpu", "parallel", "gpu", "async gpu",
+                            "async_gpu", "asyncgpu"],
+                   help="Where bootstrapping runs. 'cpu' single-threaded CPU; "
+                        "'parallel' multi-threaded CPU (default); 'gpu' CUDA; "
+                        "'async gpu' CUDA with asynchronous execution. "
+                        "'async_gpu' and 'asyncgpu' are accepted spellings of "
+                        "'async gpu' so you need not quote the space.")
     p.add_argument("--threads", type=int, default=None,
-                   help="Thread count for --mode parallel (library default is 4).")
+                   help="Thread count for --mode parallel (library default is 4). "
+                        "Ignored by the GPU modes.")
+    p.add_argument("--device", type=int, default=0,
+                   help="CUDA device index for the GPU modes. Ignored on CPU.")
     p.add_argument("--transport", default="tcp", choices=["tcp", "rdma"])
     p.add_argument("--bind", default="0.0.0.0", help="TCP transport only.")
     p.add_argument("--port", type=int, default=9998, help="TCP transport only.")
@@ -71,16 +74,43 @@ def parse_args():
 # ======================================================================
 # Engine and keys
 # ======================================================================
+GPU_MODES = ("gpu", "async gpu")
+
+
+def normalize_mode(mode: str) -> str:
+    """Accept async_gpu / asyncgpu for the space-containing 'async gpu'."""
+    return {"async_gpu": "async gpu", "asyncgpu": "async gpu"}.get(mode, mode)
+
+
 def engine_init(args):
-    kwargs = dict(use_bootstrap_to_14_levels=True, mode=args.mode, compact=args.compact)
-    if args.mode == "parallel" and args.threads:
+    mode = normalize_mode(args.mode)
+    kwargs = dict(use_bootstrap_to_14_levels=True, mode=mode, compact=args.compact)
+
+    detail = ""
+    if mode in GPU_MODES:
+        # Engine takes device_id only for the CUDA modes.
+        kwargs["device_id"] = args.device
+        detail = f", device_id={args.device}"
+        if args.threads:
+            print(f"  (ignoring --threads {args.threads}: it applies to 'parallel' only)")
+    elif mode == "parallel" and args.threads:
         kwargs["thread_count"] = args.threads
-    print(f"Engine init ({args.mode}"
-          f"{', threads=' + str(args.threads) if args.threads else ''}): ", end="", flush=True)
+        detail = f", threads={args.threads}"
+
+    print(f"Engine init (mode={mode!r}{detail}): ", end="", flush=True)
     t0 = time.perf_counter()
     engine = Engine(**kwargs)
     print(f"DONE ({time.perf_counter() - t0:.1f}s, "
           f"slot_count={engine.slot_count}, max_level={engine.max_level})")
+
+    if mode in GPU_MODES:
+        # Worth saying out loud: with the target bootstrapping on a GPU, the
+        # split stops being "GPU host offloads to CPU storage node" and becomes
+        # a two-GPU split. Useful for isolating transport cost from the CPU
+        # bootstrap penalty -- run the same workload under 'gpu' and under
+        # 'parallel' and the difference is the device, not the wire.
+        print("  NOTE: target is bootstrapping on a GPU, not the CPU. Key residency "
+              "moves to VRAM: the bootstrap key alone is ~17 GiB (~12 GiB compact).")
     return engine
 
 
