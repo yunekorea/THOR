@@ -28,6 +28,14 @@ Ported from the Liberate THOR_NDP_target.py. Three things changed:
     poetry run python THOR_NDP_target.py --transport rdma --mode gpu --device 0
     poetry run python THOR_NDP_target.py --transport rdma --mode async_gpu
 """
+import os, sys
+project_root = os.path.abspath(os.path.join(os.getcwd(), './src'))
+if project_root not in sys.path:
+    sys.path.append(project_root)
+    
+project_root = os.path.abspath(os.path.join(os.getcwd(), '../src'))
+if project_root not in sys.path:
+    sys.path.append(project_root)
 
 import argparse
 import json
