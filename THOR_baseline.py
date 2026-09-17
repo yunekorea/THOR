@@ -64,11 +64,12 @@ class BootstrapTimer:
     and `bootstrap_seconds` reported here line up with its report() fields.
     """
 
-    def __init__(self, he):
+    def __init__(self, he, verbose=True):
         self.calls = 0
         self.seconds = 0.0
         self.per_layer = {}
         self._layer = None
+        self.verbose = verbose
         self._orig = he.bootstrap
         he.bootstrap = self._call
 
@@ -77,10 +78,15 @@ class BootstrapTimer:
 
     def _call(self, ciphertext):
         self.calls += 1
+        n = self.calls
+        level_in = getattr(ciphertext, "level", None)
         t0 = time.perf_counter()
         out = self._orig(ciphertext)
         dt = time.perf_counter() - t0
         self.seconds += dt
+        if self.verbose:
+            print(f"  [bs #{n:04d}] local bootstrap in {dt:.2f}s "
+                  f"(level {level_in} -> {getattr(out, 'level', None)})")
         if self._layer is not None:
             rec = self.per_layer.setdefault(self._layer, {"calls": 0, "seconds": 0.0})
             rec["calls"] += 1
@@ -120,6 +126,21 @@ def parse_args():
                         help="Generate keys in-process instead of reading them.")
     parser.add_argument("--dataset-path", default="",
                         help="Load the dataset from a save_to_disk snapshot instead of the HuggingFace Hub, e.g. ./datasets/mrpc. Use this to run against the same samples as the Liberate results.")
+    parser.add_argument("--mode", default="gpu", choices=["gpu", "async gpu"],
+                        help="Engine mode. Defaults to 'gpu' to match "
+                             "THOR_NDP_Host.py -- HE's own default is 'async gpu', "
+                             "which is faster, so leaving it unset would make the "
+                             "baseline win on engine mode rather than on where "
+                             "bootstrapping runs.")
+    parser.add_argument("--no-rotation-key", dest="use_rotation_key",
+                        action="store_false", default=True,
+                        help="Do not load the general rotation key. The baseline "
+                             "loads it by default so its key I/O and rotation path "
+                             "match the NDP host; rotations then come from the "
+                             "bootstrap key, as stock THOR does.")
+    parser.add_argument("--quiet-bootstrap", dest="verbose_bootstrap",
+                        action="store_false", default=True,
+                        help="Do not print a line per bootstrap call.")
     parser.add_argument("--output-dir", default="./baseline_results")
     parser.add_argument("--print-rotate-levels", action="store_true")
     return parser.parse_args()
@@ -156,10 +177,18 @@ def main():
         print(f"Setting up engine and keys "
               f"({'reading ' + str(keys_dir) if keys_dir else 'generating in-process'})")
         t0 = time.perf_counter()
-        he = HE(args.device, args.compact, key_size, timer, keys_dir=keys_dir)
-        print(f"  keys ready ({time.perf_counter() - t0:.1f}s)")
+        # mode: see --mode help. use_rotation_key: load the rotation key as well
+        # as the bootstrap key, so the baseline reads the same key bytes the NDP
+        # host does plus the bootstrap key, and serves the bootstrap-delta
+        # rotations from the same key the NDP host uses. The only remaining
+        # difference between the two runs is where bootstrapping executes.
+        he = HE(args.device, args.compact, key_size, timer, keys_dir=keys_dir,
+                mode=args.mode, use_rotation_key=args.use_rotation_key)
+        rot = "rotation_key" if args.use_rotation_key else "bootstrap_key"
+        print(f"  keys ready ({time.perf_counter() - t0:.1f}s, mode={args.mode!r}, "
+              f"bootstrap key loaded, rotations served by {rot})")
 
-        bootstrap_timer = BootstrapTimer(he)
+        bootstrap_timer = BootstrapTimer(he, verbose=args.verbose_bootstrap)
 
         print("Encrypting input")
         t0 = time.perf_counter()
@@ -226,6 +255,8 @@ def main():
         device=args.device,
         compact=args.compact,
         key_size=key_size,
+        mode=args.mode,
+        use_rotation_key=args.use_rotation_key,
         keys_dir=str(keys_dir) if keys_dir else None,
         total_seconds=round(total, 3),
         layer_seconds=layer_seconds,
