@@ -3,3 +3,10 @@ src/thor/__pycache__/
 keys_desilo/
 finetuned_models/
 poetry.lock
+baseline_results/
+datasets/
+encoded_models_new/
+finetuned_models.tar
+light_plaintexts/
+ndp_host_results/
+ndp_parallel_results/
