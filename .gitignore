@@ -10,3 +10,4 @@ finetuned_models.tar
 light_plaintexts/
 ndp_host_results/
 ndp_parallel_results/
+profile_results/
