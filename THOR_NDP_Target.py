@@ -28,11 +28,14 @@ Ported from the Liberate THOR_NDP_target.py. Three things changed:
     poetry run python THOR_NDP_target.py --transport rdma --mode gpu --device 0
     poetry run python THOR_NDP_target.py --transport rdma --mode async_gpu
 """
-import os, sys
+
+import os
+import sys
+
 project_root = os.path.abspath(os.path.join(os.getcwd(), './src'))
 if project_root not in sys.path:
     sys.path.append(project_root)
-    
+
 project_root = os.path.abspath(os.path.join(os.getcwd(), '../src'))
 if project_root not in sys.path:
     sys.path.append(project_root)
@@ -217,7 +220,6 @@ def serve_tcp(args, engine, keys, stats):
 def serve_rdma(args, engine, keys, stats):
     """Original NDP path: UDS doorbell from the driver, RDMA read/send for data."""
     import ctypes
-    import os
     import selectors
     import struct
 
@@ -258,7 +260,13 @@ def serve_rdma(args, engine, keys, stats):
 
             out_mr = conn_id.reg_msgs(len(reply))
             (ctypes.c_uint8 * len(reply)).from_address(out_mr.buf)[:] = reply
-            conn_id.post_send(out_mr, len(reply))
+            # NOTE: pyverbs signature is post_send(mr, flags, length) -- the
+            # second POSITIONAL argument is FLAGS, not length. Passing the size
+            # there sets whatever IBV_SEND_* bits happen to be in the number;
+            # any size with bit 3 set turns on IBV_SEND_INLINE, and inlining a
+            # multi-MiB message makes the provider return ENOMEM. Always pass
+            # length as a keyword.
+            conn_id.post_send(out_mr, length=len(reply))
             if conn_id.get_send_comp() is None:
                 raise RuntimeError("no SEND completion")
             local_mr.close()
