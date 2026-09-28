@@ -81,7 +81,31 @@ def parse_args():
     p.add_argument("--target-ip", default="192.168.100.1", help="RDMA only.")
     p.add_argument("--service", default="9999", help="RDMA only.")
     p.add_argument("--uds", default="/tmp/rdma_metadata.sock", help="RDMA only.")
+    p.add_argument("--expect-bootstraps", type=int, default=0, metavar="N",
+                   help="Exit automatically once N bootstraps have been served AND "
+                        "their replies sent. 0 (the default) keeps the old "
+                        "behaviour: serve until Ctrl-C. One forward pass is 294 "
+                        "bootstraps, so a host running 4 parallel streams is "
+                        "294*4=1176. NOTE this is how many bootstraps the HOST "
+                        "will send; it is deliberately NOT derived from --workers, "
+                        "because target workers and host streams are independent "
+                        "knobs -- 4 workers serving a 2-stream host would sit "
+                        "waiting forever for a 1176th request that never comes.")
+    p.add_argument("--connect-after-init", action="store_true",
+                   help="Restore the old startup order: spawn workers and read "
+                        "keys first, open the transport afterwards. The default is "
+                        "the reverse, because the host opens its transport before "
+                        "doing its own init and would otherwise find nothing "
+                        "listening.")
     return p.parse_args()
+
+
+class QuotaMet(Exception):
+    """Raised once --expect-bootstraps replies have gone out, to unwind the loop."""
+
+
+def quota_met(args, stats) -> bool:
+    return bool(args.expect_bootstraps) and stats["served"] >= args.expect_bootstraps
 
 
 # ======================================================================
@@ -169,11 +193,66 @@ class Pool:
                 p.terminate()
 
 
-def serve_tcp(args, pool, stats):
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((args.bind, args.port))
-    srv.listen(1)
+# ======================================================================
+# Transport setup -- opened before the workers spawn
+# ======================================================================
+# The host opens its transport as the FIRST thing it does, before building its
+# own engine and reading its own keys. Spawning four workers that each read a
+# ~17 GiB key set takes minutes; if the endpoint only appears afterwards, the
+# host is refused and dies. So the endpoint is opened up front and the serve
+# loops are handed the open handle.
+#
+# Requests that arrive before the pool is ready are parked, not dropped: TCP
+# payloads sit in the kernel receive buffer, and RDMA doorbells sit in the UDS
+# backlog with the host's buffer still registered (the target initiates the
+# READ, so nothing moves until we move it).
+#
+# Opening before mp.Process.start() is safe because the start method is "spawn":
+# children are fresh interpreters that inherit only the queue pipes, so no
+# child ever sees the CMID or the listening socket.
+def transport_open(args):
+    if args.transport == "tcp":
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind((args.bind, args.port))
+        srv.listen(1)
+        print(f"Listening on tcp://{args.bind}:{args.port} "
+              f"(host may connect now; served once workers are ready)")
+        return {"srv": srv}
+
+    import selectors
+
+    from pyverbs.cmid import CMID, AddrInfo
+    from pyverbs.librdmacm_enums import RAI_PASSIVE, rdma_port_space
+    from pyverbs.qp import QPCap, QPInitAttr
+
+    # Same caps the Liberate target used on this hardware. Do not raise these
+    # without checking `ibv_devinfo -v | grep max_qp_wr` -- an unsupported value
+    # is silently clamped, and you end up with a smaller queue than you think.
+    cap = QPCap(max_send_wr=16, max_recv_wr=16, max_send_sge=8)
+    cai = AddrInfo(src=args.target_ip, src_service=args.service,
+                   port_space=rdma_port_space.RDMA_PS_TCP, flags=RAI_PASSIVE)
+    cid = CMID(creator=cai, qp_init_attr=QPInitAttr(cap=cap))
+    cid.listen()
+    print(f"RDMA listening on {args.target_ip}:{args.service} -- waiting for host")
+    conn_id = cid.get_request()
+    conn_id.accept()
+    print("RDMA connected")
+
+    if os.path.exists(args.uds):
+        os.remove(args.uds)
+    uds = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    uds.bind(args.uds)
+    uds.listen(64)
+    uds.setblocking(False)
+    sel = selectors.DefaultSelector()
+    sel.register(uds, selectors.EVENT_READ)
+    print(f"Offload doorbell open at {args.uds}")
+    return {"cid": cid, "conn_id": conn_id, "uds": uds, "sel": sel}
+
+
+def serve_tcp(args, link, pool, stats):
+    srv = link["srv"]
     print(f"Target ready on tcp://{args.bind}:{args.port}")
 
     while True:
@@ -182,6 +261,7 @@ def serve_tcp(args, pool, stats):
         print(f"Host connected from {peer}")
         send_lock = threading.Lock()
         stop = threading.Event()
+        quota = threading.Event()
 
         def sender():
             # Replies leave in completion order, not arrival order -- the id in
@@ -200,6 +280,21 @@ def serve_tcp(args, pool, stats):
                     except OSError:
                         return
                 stats["served"] += 1
+
+                # The quota is reached here, in the sender, but the reader
+                # thread is parked in a blocking recv_exact and will not notice
+                # a flag. Half-closing the read side makes its recv return b""
+                # so recv_exact yields None and the reader falls out of its
+                # loop; quota then tells the outer loop this was deliberate
+                # rather than the host hanging up.
+                if quota_met(args, stats):
+                    quota.set()
+                    stop.set()
+                    try:
+                        conn.shutdown(socket.SHUT_RD)
+                    except OSError:
+                        pass
+                    return
 
         t = threading.Thread(target=sender, daemon=True)
         t.start()
@@ -222,10 +317,12 @@ def serve_tcp(args, pool, stats):
             stop.set()
             t.join(timeout=2)
             conn.close()
-            print("Host disconnected; waiting for the next connection.")
+        if quota.is_set():
+            raise QuotaMet
+        print("Host disconnected; waiting for the next connection.")
 
 
-def serve_rdma(args, pool, stats):
+def serve_rdma(args, link, pool, stats):
     """UNTESTED on hardware -- but structured to avoid the RDMA pitfalls below.
 
     ONE thread owns the CMID. Nothing else touches it.
@@ -250,22 +347,9 @@ def serve_rdma(args, pool, stats):
     import selectors
     import struct as _struct
 
-    from pyverbs.cmid import CMID, AddrInfo
-    from pyverbs.librdmacm_enums import RAI_PASSIVE, rdma_port_space
-    from pyverbs.qp import QPCap, QPInitAttr
-
-    # Same caps the Liberate target used on this hardware. Do not raise these
-    # without checking `ibv_devinfo -v | grep max_qp_wr` -- an unsupported value
-    # is silently clamped, and you end up with a smaller queue than you think.
-    cap = QPCap(max_send_wr=16, max_recv_wr=16, max_send_sge=8)
-    cai = AddrInfo(src=args.target_ip, src_service=args.service,
-                   port_space=rdma_port_space.RDMA_PS_TCP, flags=RAI_PASSIVE)
-    cid = CMID(creator=cai, qp_init_attr=QPInitAttr(cap=cap))
-    print("RDMA listening")
-    cid.listen()
-    conn_id = cid.get_request()
-    conn_id.accept()
-    print("RDMA connected")
+    conn_id = link["conn_id"]
+    srv = link["uds"]
+    sel = link["sel"]
 
     # One MR per transfer, sized exactly to the message -- this is what the
     # Liberate target did on this hardware. A single oversized MR reused for
@@ -290,14 +374,9 @@ def serve_rdma(args, pool, stats):
                                f"subsequent post will fail)")
         return wc
 
-    if os.path.exists(args.uds):
-        os.remove(args.uds)
-    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    srv.bind(args.uds)
-    srv.listen(64)
-    srv.setblocking(False)
-    sel = selectors.DefaultSelector()
-    sel.register(srv, selectors.EVENT_READ)
+    # The UDS listener and its selector were created by transport_open(), before
+    # the workers spawned -- do NOT rebind them here. Rebinding would unlink the
+    # socket the NDP driver may already have queued a doorbell on.
 
     pending = []          # UDS connections with metadata ready
     # req_id -> (uds_conn, local_mr). The working single-stream target keeps BOTH
@@ -378,6 +457,11 @@ def serve_rdma(args, pool, stats):
             print(f"  sent reply for req {req_id} ({len(blob) / 1024**2:.1f} MiB)",
                   flush=True)
 
+            # Checked here, after the send completed and this request's MRs and
+            # UDS handle are released -- never mid-transfer.
+            if quota_met(args, stats):
+                raise QuotaMet
+
 
 def main():
     args = parse_args()
@@ -388,11 +472,29 @@ def main():
         raise SystemExit(f"{keys_dir} built with compact={params.get('compact')}, "
                          f"target running compact={args.compact}.")
 
+    # Transport first, then the slow init. Spawning workers and reading a key
+    # set per worker takes minutes; the host opens its transport before doing
+    # any of its own setup, so anything before this line is time the host
+    # spends unable to reach us.
+    link = None
+    if not args.connect_after_init:
+        link = transport_open(args)
+
     started = time.perf_counter()
     pool = Pool(args, keys_dir)
+
+    if link is None:
+        link = transport_open(args)
+
+    if args.expect_bootstraps:
+        print(f"Will exit automatically after {args.expect_bootstraps} bootstraps.")
+
     stats = {"received": 0, "served": 0}
     try:
-        (serve_tcp if args.transport == "tcp" else serve_rdma)(args, pool, stats)
+        (serve_tcp if args.transport == "tcp" else serve_rdma)(
+            args, link, pool, stats)
+    except QuotaMet:
+        print(f"\nServed {args.expect_bootstraps} bootstraps as requested; exiting.")
     except KeyboardInterrupt:
         print("\nShutting down.")
     finally:

@@ -79,6 +79,17 @@ def parse_args():
     p.add_argument("--service", default="9999", help="RDMA transport only.")
     p.add_argument("--uds", default="/tmp/rdma_metadata.sock",
                    help="Unix socket the NDP driver writes offload metadata to.")
+    p.add_argument("--expect-bootstraps", type=int, default=0, metavar="N",
+                   help="Exit automatically once N bootstraps have been served AND "
+                        "their replies sent. 0 (the default) keeps the old "
+                        "behaviour: serve until Ctrl-C. One forward pass is 294 "
+                        "bootstraps, so a single-stream host is 294.")
+    p.add_argument("--connect-after-init", action="store_true",
+                   help="Restore the old startup order: build the engine and read "
+                        "keys first, open the transport afterwards. The default is "
+                        "the reverse, because the host opens its transport before "
+                        "doing its own init and would otherwise find nothing "
+                        "listening.")
     return p.parse_args()
 
 
@@ -149,6 +160,74 @@ def key_init(engine, keys_dir: Path, compact: bool):
     return keys
 
 
+class QuotaMet(Exception):
+    """Raised once --expect-bootstraps replies have gone out, to unwind the loop."""
+
+
+def quota_met(args, stats) -> bool:
+    return bool(args.expect_bootstraps) and stats["calls"] >= args.expect_bootstraps
+
+
+# ======================================================================
+# Transport setup -- deliberately split from the serve loops
+# ======================================================================
+# The host opens its transport as the FIRST thing it does, before building its
+# own engine and reading its own keys. If the target only starts listening
+# after reading ~17 GiB of bootstrap key, the host is refused and dies. So the
+# endpoint is opened here, up front, and the serve loops below are handed the
+# already-open handle.
+#
+# Opening early is safe in both transports because a request that arrives
+# before the engine exists is parked rather than dropped:
+#   TCP  -- the payload sits in the kernel receive buffer; a large one simply
+#           blocks the host's sendall until we start reading.
+#   RDMA -- the doorbell sits in the UDS backlog, and the host's buffer stays
+#           registered. The target initiates the READ, so nothing moves until
+#           we are ready to move it.
+def transport_open(args):
+    """Open the listening endpoint NOW. Returns a handle for the serve loop."""
+    if args.transport == "tcp":
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind((args.bind, args.port))
+        srv.listen(1)
+        print(f"Listening on tcp://{args.bind}:{args.port} "
+              f"(host may connect now; it will be served once keys are read)")
+        return {"srv": srv}
+
+    import selectors
+
+    from pyverbs.cmid import CMID, AddrInfo
+    from pyverbs.librdmacm_enums import RAI_PASSIVE, rdma_port_space
+    from pyverbs.qp import QPCap, QPInitAttr
+
+    cap = QPCap(max_send_wr=16, max_recv_wr=16, max_send_sge=8)
+    cai = AddrInfo(src=args.target_ip, src_service=args.service,
+                   port_space=rdma_port_space.RDMA_PS_TCP, flags=RAI_PASSIVE)
+    cid = CMID(creator=cai, qp_init_attr=QPInitAttr(cap=cap))
+    cid.listen()
+    # get_request() blocks until the host connects. That is the intent: the
+    # target parks here until its peer shows up, then does its slow init while
+    # the host does the same.
+    print(f"RDMA listening on {args.target_ip}:{args.service} -- waiting for host")
+    conn_id = cid.get_request()
+    conn_id.accept()
+    print("RDMA connected")
+
+    # The UDS doorbell must exist before the first offload, which is much later,
+    # but creating it here keeps every "can the host reach us" concern in one
+    # place instead of racing the key load.
+    if os.path.exists(args.uds):
+        os.remove(args.uds)
+    uds = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    uds.bind(args.uds)
+    uds.listen(64)
+    uds.setblocking(False)
+    sel = selectors.DefaultSelector()
+    print(f"Offload doorbell open at {args.uds}")
+    return {"cid": cid, "conn_id": conn_id, "uds": uds, "sel": sel}
+
+
 def do_bootstrap(engine, keys, payload: bytes, stats) -> bytes:
     stats["calls"] += 1
     n = stats["calls"]
@@ -176,11 +255,8 @@ def do_bootstrap(engine, keys, payload: bytes, stats) -> bytes:
 # ======================================================================
 # Transports
 # ======================================================================
-def serve_tcp(args, engine, keys, stats):
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((args.bind, args.port))
-    srv.listen(1)
+def serve_tcp(args, link, engine, keys, stats):
+    srv = link["srv"]
     print(f"Target ready on tcp://{args.bind}:{args.port}. Waiting for the host.")
 
     def recv_exact(sock, n):
@@ -210,40 +286,35 @@ def serve_tcp(args, engine, keys, stats):
                 if payload is None:
                     break
                 conn.sendall(frame(do_bootstrap(engine, keys, payload, stats)))
+                # Checked AFTER the reply is on the wire, never before -- the
+                # host is blocked waiting for it.
+                if quota_met(args, stats):
+                    raise QuotaMet
+        except QuotaMet:
+            conn.close()
+            raise
         except Exception as exc:
             print(f"Connection error: {type(exc).__name__}: {exc}")
-        finally:
+            conn.close()
+            print("Host disconnected; waiting for the next connection.")
+        else:
             conn.close()
             print("Host disconnected; waiting for the next connection.")
 
 
-def serve_rdma(args, engine, keys, stats):
-    """Original NDP path: UDS doorbell from the driver, RDMA read/send for data."""
+def serve_rdma(args, link, engine, keys, stats):
+    """Original NDP path: UDS doorbell from the driver, RDMA read/send for data.
+
+    The CMID, the accepted connection and the UDS listener were all opened by
+    transport_open() before the engine existed; this function only runs the loop.
+    """
     import ctypes
     import selectors
     import struct
 
-    from pyverbs.cmid import CMID, AddrInfo
-    from pyverbs.librdmacm_enums import RAI_PASSIVE, rdma_port_space
-    from pyverbs.qp import QPCap, QPInitAttr
-
-    cap = QPCap(max_send_wr=16, max_recv_wr=16, max_send_sge=8)
-    cai = AddrInfo(src=args.target_ip, src_service=args.service,
-                   port_space=rdma_port_space.RDMA_PS_TCP, flags=RAI_PASSIVE)
-    cid = CMID(creator=cai, qp_init_attr=QPInitAttr(cap=cap))
-    print("RDMA listening")
-    cid.listen()
-    conn_id = cid.get_request()
-    conn_id.accept()
-    print("RDMA connected")
-
-    if os.path.exists(args.uds):
-        os.remove(args.uds)
-    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    srv.bind(args.uds)
-    srv.listen(1)
-    srv.setblocking(False)
-    sel = selectors.DefaultSelector()
+    conn_id = link["conn_id"]
+    srv = link["uds"]
+    sel = link["sel"]
 
     def handle(conn):
         data = conn.recv(128)
@@ -273,6 +344,10 @@ def serve_rdma(args, engine, keys, stats):
             out_mr.close()
         sel.unregister(conn)
         conn.close()
+        # Raised only after the reply has completed and every resource for this
+        # request is released, so unwinding cannot leak an MR or a UDS handle.
+        if quota_met(args, stats):
+            raise QuotaMet
 
     def accept(sock):
         conn, _ = sock.accept()
@@ -291,13 +366,29 @@ def main():
     keys_dir = Path(args.keys_dir) if args.keys_dir else \
         Path("./keys_desilo") / ("compact" if args.compact else "default")
 
+    # Transport first, then the slow init. The host opens its transport before
+    # doing any of its own setup, so anything that runs before this line is time
+    # the host spends unable to reach us.
+    link = None
+    if not args.connect_after_init:
+        link = transport_open(args)
+
     engine = engine_init(args)
     print(f"Loading keys from {keys_dir} (secret key is not read)")
     keys = key_init(engine, keys_dir, args.compact)
 
+    if link is None:
+        link = transport_open(args)
+
+    if args.expect_bootstraps:
+        print(f"Will exit automatically after {args.expect_bootstraps} bootstraps.")
+
     stats = {"calls": 0, "bootstrap_seconds": 0.0, "codec_seconds": 0.0}
     try:
-        (serve_tcp if args.transport == "tcp" else serve_rdma)(args, engine, keys, stats)
+        (serve_tcp if args.transport == "tcp" else serve_rdma)(
+            args, link, engine, keys, stats)
+    except QuotaMet:
+        print(f"\nServed {args.expect_bootstraps} bootstraps as requested; exiting.")
     except KeyboardInterrupt:
         print("\nShutting down.")
     finally:
