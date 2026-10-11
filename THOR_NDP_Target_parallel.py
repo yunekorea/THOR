@@ -42,6 +42,7 @@ if project_root not in sys.path:
     sys.path.append(project_root)
 
 import argparse
+import glob
 import json
 import multiprocessing as mp
 import queue
@@ -57,6 +58,87 @@ GPU_MODES = ("gpu", "async gpu")
 
 def normalize_mode(mode: str) -> str:
     return {"async_gpu": "async gpu", "asyncgpu": "async gpu"}.get(mode, mode)
+
+
+# ======================================================================
+# NUMA topology
+# ======================================================================
+# On a two-socket box each socket has its own memory controllers, so a worker
+# reading a key that lives on the other socket pays the UPI hop for every cache
+# line -- higher latency and a shared interconnect ceiling instead of a private
+# set of channels. Spreading workers across nodes and keeping each one's keys
+# local is the difference between using both sockets' channels and funnelling
+# everything through one socket's.
+def numa_topology():
+    """[(node_id, [cpu ids])] from sysfs, or [] if not a NUMA machine."""
+    out = []
+    for path in sorted(glob.glob("/sys/devices/system/node/node[0-9]*")):
+        try:
+            nid = int(path.rsplit("node", 1)[1])
+            cpus = parse_cpulist(Path(f"{path}/cpulist").read_text().strip())
+        except (OSError, ValueError):
+            continue
+        if cpus:
+            out.append((nid, cpus))
+    return sorted(out)
+
+
+def format_cpulist(cpus):
+    """[0..15, 32..47] -> '0-15,32-47'.
+
+    Printing first-last would render that node as '0-47', which looks like the
+    mask leaked onto the other socket. A node's CPUs are not contiguous once
+    hyperthread siblings are numbered separately, so collapse to real ranges.
+    """
+    cpus = sorted(cpus)
+    if not cpus:
+        return "-"
+    parts, start, prev = [], cpus[0], cpus[0]
+    for c in cpus[1:] + [None]:
+        if c is not None and c == prev + 1:
+            prev = c
+            continue
+        parts.append(f"{start}" if start == prev else f"{start}-{prev}")
+        if c is not None:
+            start = prev = c
+    return ",".join(parts)
+
+
+def parse_cpulist(spec):
+    """'0-15,32-47' -> [0..15, 32..47]."""
+    cpus = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            cpus.extend(range(int(a), int(b) + 1))
+        else:
+            cpus.append(int(part))
+    return cpus
+
+
+def node_meminfo(nid):
+    """(MemFree MiB, hugepages reserved MiB) for one node."""
+    free = huge = 0
+    try:
+        for line in Path(f"/sys/devices/system/node/node{nid}/meminfo").read_text().splitlines():
+            if "MemFree:" in line:
+                free = int(line.split()[-2]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    # SPDK's hugepage reservation shows as 'used' to the kernel but appears in no
+    # process's RSS, so it is invisible unless looked for explicitly -- and it is
+    # exactly what makes a node unable to hold its workers' keys.
+    for pat in ("hugepages-2048kB", "hugepages-1048576kB"):
+        try:
+            p = Path(f"/sys/devices/system/node/node{nid}/hugepages/{pat}/nr_hugepages")
+            n = int(p.read_text().strip())
+            huge += n * (2 if "2048" in pat else 1024)
+        except (OSError, ValueError):
+            pass
+    return free, huge
 
 
 def parse_args():
@@ -97,6 +179,27 @@ def parse_args():
                         "the reverse, because the host opens its transport before "
                         "doing its own init and would otherwise find nothing "
                         "listening.")
+    p.add_argument("--numa-bind", action="store_true",
+                   help="Pin each worker to one NUMA node, round-robin: worker 0 "
+                        "to node 0, worker 1 to node 1, worker 2 back to node 0, "
+                        "and so on. Each worker's keys then land on that node's "
+                        "own DIMMs, so workers use both sockets' memory channels "
+                        "instead of funnelling every access through one socket's. "
+                        "Size --threads to cores-per-node divided by "
+                        "workers-per-node.")
+    p.add_argument("--numa-nodes", default=None, metavar="LIST",
+                   help="Restrict --numa-bind to these nodes, e.g. '0,1' or '0'. "
+                        "Default: every node the machine reports.")
+    p.add_argument("--key-gib", type=float, default=17.5, metavar="GIB",
+                   help="Resident key-set size per worker, for the per-node "
+                        "capacity check (default 17.5; use ~12.5 with --compact).")
+    p.add_argument("--bootstrap-log", default=None, metavar="CSV",
+                   help="Append one row per bootstrap: wall-clock start and end, "
+                        "levels, duration. Each worker writes its OWN file, "
+                        "<CSV>.w<id>, so concurrent processes never interleave "
+                        "into one file. Feed these plus membw.py's CSV to "
+                        "membw_join.py to get DRAM bandwidth broken down by how "
+                        "many workers were bootstrapping at the time.")
     return p.parse_args()
 
 
@@ -115,6 +218,26 @@ def worker_main(wid, cfg, req_q, res_q, ready_q):
     """Own Engine, own keys, pull work forever."""
     from desilofhe import Engine
 
+    # Pin BEFORE the Engine exists. Two reasons, both load-bearing:
+    #   1. desilofhe's parallel mode spawns its own threads, and threads inherit
+    #      the affinity mask in place when they are created. Pinning afterwards
+    #      would leave those threads free to roam across both sockets.
+    #   2. Linux's default memory policy is first-touch-local, so once this
+    #      process only runs on node N's CPUs, the ~17.5 GiB of keys it reads
+    #      lands on node N's DIMMs automatically. No libnuma, no explicit
+    #      membind, and -- unlike a strict `numactl --membind` -- no OOM kill if
+    #      the node fills up; it degrades to remote pages instead of dying.
+    node_info = ""
+    if cfg.get("numa_map"):
+        nid, cpus = cfg["numa_map"][wid % len(cfg["numa_map"])]
+        try:
+            os.sched_setaffinity(0, set(cpus))
+            got = sorted(os.sched_getaffinity(0))
+            node_info = (f" [NUMA node {nid}, {len(got)} cpus: "
+                         f"{format_cpulist(got)}]")
+        except OSError as exc:
+            node_info = f" [NUMA bind FAILED: {exc}]"
+
     mode = cfg["mode"]
     kwargs = dict(use_bootstrap_to_14_levels=True, mode=mode, compact=cfg["compact"])
     if mode in GPU_MODES:
@@ -128,7 +251,15 @@ def worker_main(wid, cfg, req_q, res_q, ready_q):
     relin = engine.read_relinearization_key(str(keys_dir / "relinearization_key"))
     conj = engine.read_conjugation_key(str(keys_dir / "conjugation_key"))
     bskey = engine.read_bootstrap_key(str(keys_dir / "bootstrap_key"))
-    ready_q.put((wid, os.getpid(), round(time.perf_counter() - t0, 1)))
+    ready_q.put((wid, os.getpid(), round(time.perf_counter() - t0, 1), node_info))
+
+    # Own file per worker. Four processes appending to one file would interleave
+    # partial lines; separate files need no locking and cost nothing, and
+    # membw_join.py globs them back together.
+    bslog = None
+    if cfg.get("bootstrap_log"):
+        bslog = open(f"{cfg['bootstrap_log']}.w{wid}", "w", buffering=1)
+        bslog.write("worker,seq,t_start,t_end,duration_s,level_in,level_out\n")
 
     served = 0
     while True:
@@ -140,27 +271,114 @@ def worker_main(wid, cfg, req_q, res_q, ready_q):
             t0 = time.perf_counter()
             ct = engine.deserialize_ciphertext(payload)
             level_in = ct.level
+            # Bracket the bootstrap call ONLY. deserialize/serialize are left
+            # outside: their memory traffic is not bootstrap traffic, and
+            # including it would inflate the figure being measured.
+            wall0 = time.time()
             out = engine.bootstrap(ct, relin, conj, bskey)
+            wall1 = time.time()
             reply = bytes(engine.serialize_ciphertext(out))
             dt = time.perf_counter() - t0
             served += 1
+            if bslog is not None:
+                bslog.write(f"{wid},{served},{wall0:.3f},{wall1:.3f},"
+                            f"{wall1 - wall0:.3f},{level_in},{out.level}\n")
             print(f"[w{wid}] req {req_id} level {level_in} -> {out.level} in {dt:.1f}s "
                   f"(served {served})", flush=True)
             res_q.put((req_id, reply, None))
         except Exception as exc:
             res_q.put((req_id, None, f"{type(exc).__name__}: {exc}"))
 
+    if bslog is not None:
+        bslog.close()
+
 
 # ======================================================================
 # Launcher
 # ======================================================================
+def plan_numa(args):
+    """Decide the worker -> node mapping and sanity-check it. [] disables binding."""
+    if not args.numa_bind:
+        return []
+
+    topo = numa_topology()
+    if args.numa_nodes:
+        wanted = {int(x) for x in args.numa_nodes.replace(" ", "").split(",") if x}
+        topo = [(n, c) for n, c in topo if n in wanted]
+        missing = wanted - {n for n, _ in topo}
+        if missing:
+            raise SystemExit(f"--numa-nodes names node(s) {sorted(missing)} that "
+                             f"this machine does not report.")
+    if not topo:
+        print("  --numa-bind requested but no NUMA nodes found; running unpinned.")
+        return []
+    if len(topo) == 1:
+        print(f"  --numa-bind: only one node ({topo[0][0]}); pinning is a no-op "
+              f"for locality.")
+
+    # In a GPU mode the key set lives in VRAM, not in this node's DIMMs, so the
+    # host-RAM capacity check below would be measuring the wrong pool and would
+    # warn about a shortage that does not apply. Pinning still has a small point
+    # (staging buffers and the PCIe path stay on one node), so keep the binding
+    # and only drop the memory arithmetic.
+    on_gpu = normalize_mode(args.mode) in GPU_MODES
+    if on_gpu:
+        print(f"  (GPU mode: keys go to VRAM on device {args.device}, "
+              f"~{args.workers * args.key_gib:.0f} GiB for {args.workers} "
+              f"worker(s) -- host-RAM check below does not apply)")
+
+    print(f"NUMA layout ({len(topo)} node{'s' if len(topo) != 1 else ''}):")
+    per_node = {}
+    for i in range(args.workers):
+        nid = topo[i % len(topo)][0]
+        per_node.setdefault(nid, []).append(i)
+
+    need_warn = False
+    for nid, cpus in topo:
+        mine = per_node.get(nid, [])
+        free_mib, huge_mib = node_meminfo(nid)
+        need_gib = len(mine) * args.key_gib
+        threads_each = args.threads or 4
+        line = (f"  node {nid}: {len(cpus)} cpus, {free_mib / 1024:.0f} GiB free")
+        if huge_mib:
+            line += f" (+{huge_mib / 1024:.0f} GiB hugepages reserved)"
+        line += f" <- workers {mine or '-'}"
+        print(line)
+        if mine and on_gpu:
+            print(f"    keys in VRAM, not here")
+        elif mine:
+            print(f"    needs ~{need_gib:.0f} GiB of keys, "
+                  f"{len(mine) * threads_each} engine threads on {len(cpus)} cpus")
+            if free_mib / 1024 < need_gib:
+                spill = ("pages will spill to another node and you lose the "
+                         "locality you are\n       pinning for"
+                         if len(topo) > 1 else
+                         "the run will swap or be OOM-killed")
+                print(f"    !! only {free_mib / 1024:.0f} GiB free but "
+                      f"~{need_gib:.0f} GiB of keys wanted -- {spill}.")
+                need_warn = True
+            if len(mine) * threads_each > len(cpus):
+                print(f"    !! {len(mine) * threads_each} engine threads on "
+                      f"{len(cpus)} cpus oversubscribes this node; "
+                      f"use --threads {max(1, len(cpus) // len(mine))}")
+                need_warn = True
+
+    if need_warn:
+        print("\n  (SPDK hugepages count against a node's free memory but appear "
+              "in no process's\n   RSS, so they are easy to miss -- they are "
+              "included above.)")
+    return [(n, c) for n, c in topo]
+
+
 class Pool:
     def __init__(self, args, keys_dir):
         self.args = args
         mp.set_start_method("spawn", force=True)
         self.req_q, self.res_q, ready_q = mp.Queue(), mp.Queue(), mp.Queue()
+        numa_map = plan_numa(args)
         cfg = dict(mode=normalize_mode(args.mode), compact=args.compact,
-                   threads=args.threads, device=args.device, keys_dir=str(keys_dir))
+                   threads=args.threads, device=args.device, keys_dir=str(keys_dir),
+                   bootstrap_log=args.bootstrap_log, numa_map=numa_map)
 
         print(f"Spawning {args.workers} workers (mode={cfg['mode']!r}"
               f"{', threads=' + str(args.threads) if args.threads and cfg['mode'] == 'parallel' else ''})")
@@ -176,9 +394,44 @@ class Pool:
 
         # Do not serve until every worker has its keys, or the first requests
         # queue behind a worker still reading GiBs off disk.
-        for _ in range(args.workers):
-            wid, pid, secs = ready_q.get()
-            print(f"  worker {wid} ready (pid {pid}, {secs}s)")
+        #
+        # Poll with a timeout rather than blocking: a worker that dies during
+        # init -- CUDA out of memory is the usual way, when several workers each
+        # want ~17.5 GiB on one GPU -- never reaches ready_q, and a bare get()
+        # would wait for it forever with nothing printed. Check liveness instead
+        # and say which worker died.
+        ready = 0
+        while ready < args.workers:
+            try:
+                wid, pid, secs, node_info = ready_q.get(timeout=5)
+            except queue.Empty:
+                dead = [(i, p.exitcode) for i, p in enumerate(self.procs)
+                        if not p.is_alive()]
+                if dead:
+                    for p in self.procs:
+                        if p.is_alive():
+                            p.terminate()
+                    detail = ", ".join(f"worker {i} (exit {code})"
+                                       for i, code in dead)
+                    hint = ""
+                    if cfg["mode"] in GPU_MODES:
+                        hint = (f"\nEach worker needs ~{args.key_gib:.0f} GiB of "
+                                f"VRAM for its own key set, so {args.workers} "
+                                f"workers need ~{args.workers * args.key_gib:.0f} "
+                                f"GiB on device {args.device}.\nCheck "
+                                f"`nvidia-smi`; if that does not fit, use "
+                                f"--workers 1 or --compact. Note that separate "
+                                f"CUDA contexts on one device time-slice rather "
+                                f"than run\nconcurrently, so extra workers on a "
+                                f"single GPU cost VRAM without adding "
+                                f"throughput.")
+                    raise SystemExit(
+                        f"\nWorker died during init: {detail}.{hint}\n"
+                        f"The traceback is above this line."
+                    )
+                continue
+            ready += 1
+            print(f"  worker {wid} ready (pid {pid}, {secs}s){node_info}")
         print("All workers ready.")
 
     def submit(self, req_id, payload):
