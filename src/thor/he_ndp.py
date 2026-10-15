@@ -38,15 +38,12 @@ TRANSPORTS
 `RdmaNvmeTransport` reproduces the original path: allocate an MR, hand its
 rkey/addr/length to the NDP device through an NVMe passthrough command
 (opcode 0xdb), let the target RDMA-read it, then wait for the result to arrive
-by RDMA send. `TcpTransport` is a plain sockets fallback with the same request
-/response shape, for validating correctness before the NDP hardware is in the
-loop. Both move the same bytes.
+by RDMA send. It is the only transport; an earlier TCP fallback was removed.
 
 UNVERIFIED HERE: the RDMA and NVMe paths need your hardware. They are a
 structural port of code you already had working, not something I could execute.
 """
 
-import socket
 import struct
 import time
 from pathlib import Path
@@ -77,40 +74,6 @@ def unframe(buf: memoryview | bytes) -> bytes:
 # ======================================================================
 # Transports
 # ======================================================================
-class TcpTransport:
-    """Length-prefixed request/response over TCP. Bring-up and correctness runs.
-
-    Not the NDP datapath -- it exists so you can prove the split is numerically
-    correct before RDMA and the NVMe passthrough are involved.
-    """
-
-    def __init__(self, host, port=9998):
-        self.addr = (host, port)
-        self.sock = socket.create_connection(self.addr)
-        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-
-    def request(self, payload: bytes) -> bytes:
-        self.sock.sendall(frame(payload))
-        head = self._recv_exact(_HEADER.size)
-        magic, length = _HEADER.unpack(head)
-        if magic != _MAGIC:
-            raise ValueError(f"bad magic {magic!r} in response")
-        return self._recv_exact(length)
-
-    def _recv_exact(self, n: int) -> bytes:
-        chunks, got = [], 0
-        while got < n:
-            b = self.sock.recv(min(1 << 20, n - got))
-            if not b:
-                raise ConnectionError(f"connection closed after {got}/{n} bytes")
-            chunks.append(b)
-            got += len(b)
-        return b"".join(chunks)
-
-    def close(self):
-        self.sock.close()
-
-
 class RdmaNvmeTransport:
     """The NDP datapath: RDMA buffers, NVMe passthrough doorbell.
 
@@ -259,6 +222,11 @@ class HENDP(HE):
 
         dt = time.perf_counter() - t_all
         self.bootstrap_seconds += dt
+        # attribute this bootstrap to the stage that triggered it (StageTimer);
+        # the plain thor.timer.Timer has no such hook, so check first
+        note = getattr(self.timer, "note_bootstrap", None)
+        if note is not None:
+            note(dt)
         if self.verbose:
             print(f"  [bs #{n:04d}] offloaded {len(payload)/1024**2:.1f}MiB -> "
                   f"{len(reply)/1024**2:.1f}MiB in {dt:.2f}s "
@@ -277,8 +245,8 @@ class HENDP(HE):
 
 
 def make_transport(kind, args):
-    if kind == "tcp":
-        return TcpTransport(args.target_ip, args.port)
+    # RDMA is the only transport: there is no practical way to move ciphertexts
+    # over TCP in this setup, so the TCP fallback was removed.
     if kind == "rdma":
         return RdmaNvmeTransport(host_ip=args.host_ip, target_ip=args.target_ip,
                                  nvme_dev=args.nvme_dev, ib_dev=args.ib_dev)

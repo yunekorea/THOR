@@ -24,7 +24,7 @@ Ported from the Liberate THOR_NDP_target.py. Three things changed:
    hand-rolled DataStruct walk, so this file no longer needs to know anything
    about tensor layout.
 
-    poetry run python THOR_NDP_target.py --transport tcp --mode parallel --threads 64
+    poetry run python THOR_NDP_target.py --transport rdma --mode parallel --threads 64
     poetry run python THOR_NDP_target.py --transport rdma --mode gpu --device 0
     poetry run python THOR_NDP_target.py --transport rdma --mode async_gpu
 """
@@ -71,12 +71,12 @@ def parse_args():
                         "Ignored by the GPU modes.")
     p.add_argument("--device", type=int, default=0,
                    help="CUDA device index for the GPU modes. Ignored on CPU.")
-    p.add_argument("--transport", default="tcp", choices=["tcp", "rdma"])
-    p.add_argument("--bind", default="0.0.0.0", help="TCP transport only.")
-    p.add_argument("--port", type=int, default=9998, help="TCP transport only.")
-    p.add_argument("--host-ip", default="192.168.100.2", help="RDMA transport only.")
-    p.add_argument("--target-ip", default="192.168.100.1", help="RDMA transport only.")
-    p.add_argument("--service", default="9999", help="RDMA transport only.")
+    p.add_argument("--transport", default="rdma", choices=["rdma"],
+                   help="RDMA is the only transport (the TCP fallback was removed); "
+                        "the flag is kept so scripts passing --transport rdma still work.")
+    p.add_argument("--host-ip", default="192.168.100.2")
+    p.add_argument("--target-ip", default="192.168.100.1")
+    p.add_argument("--service", default="9999", help="RDMA CM service (port).")
     p.add_argument("--uds", default="/tmp/rdma_metadata.sock",
                    help="Unix socket the NDP driver writes offload metadata to.")
     p.add_argument("--expect-bootstraps", type=int, default=0, metavar="N",
@@ -177,24 +177,12 @@ def quota_met(args, stats) -> bool:
 # endpoint is opened here, up front, and the serve loops below are handed the
 # already-open handle.
 #
-# Opening early is safe in both transports because a request that arrives
-# before the engine exists is parked rather than dropped:
-#   TCP  -- the payload sits in the kernel receive buffer; a large one simply
-#           blocks the host's sendall until we start reading.
-#   RDMA -- the doorbell sits in the UDS backlog, and the host's buffer stays
-#           registered. The target initiates the READ, so nothing moves until
-#           we are ready to move it.
+# Opening early is safe because a request that arrives before the engine
+# exists is parked rather than dropped: the doorbell sits in the UDS backlog,
+# and the host's buffer stays registered. The target initiates the READ, so
+# nothing moves until we are ready to move it.
 def transport_open(args):
-    """Open the listening endpoint NOW. Returns a handle for the serve loop."""
-    if args.transport == "tcp":
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind((args.bind, args.port))
-        srv.listen(1)
-        print(f"Listening on tcp://{args.bind}:{args.port} "
-              f"(host may connect now; it will be served once keys are read)")
-        return {"srv": srv}
-
+    """Open the RDMA endpoint NOW. Returns a handle for the serve loop."""
     import selectors
 
     from pyverbs.cmid import CMID, AddrInfo
@@ -255,53 +243,6 @@ def do_bootstrap(engine, keys, payload: bytes, stats) -> bytes:
 # ======================================================================
 # Transports
 # ======================================================================
-def serve_tcp(args, link, engine, keys, stats):
-    srv = link["srv"]
-    print(f"Target ready on tcp://{args.bind}:{args.port}. Waiting for the host.")
-
-    def recv_exact(sock, n):
-        chunks, got = [], 0
-        while got < n:
-            b = sock.recv(min(1 << 20, n - got))
-            if not b:
-                return None
-            chunks.append(b)
-            got += len(b)
-        return b"".join(chunks)
-
-    from thor.he_ndp import _HEADER, _MAGIC
-    while True:
-        conn, peer = srv.accept()
-        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        print(f"Host connected from {peer}")
-        try:
-            while True:
-                head = recv_exact(conn, _HEADER.size)
-                if head is None:
-                    break
-                magic, length = _HEADER.unpack(head)
-                if magic != _MAGIC:
-                    raise ValueError(f"bad magic {magic!r}")
-                payload = recv_exact(conn, length)
-                if payload is None:
-                    break
-                conn.sendall(frame(do_bootstrap(engine, keys, payload, stats)))
-                # Checked AFTER the reply is on the wire, never before -- the
-                # host is blocked waiting for it.
-                if quota_met(args, stats):
-                    raise QuotaMet
-        except QuotaMet:
-            conn.close()
-            raise
-        except Exception as exc:
-            print(f"Connection error: {type(exc).__name__}: {exc}")
-            conn.close()
-            print("Host disconnected; waiting for the next connection.")
-        else:
-            conn.close()
-            print("Host disconnected; waiting for the next connection.")
-
-
 def serve_rdma(args, link, engine, keys, stats):
     """Original NDP path: UDS doorbell from the driver, RDMA read/send for data.
 
@@ -385,8 +326,7 @@ def main():
 
     stats = {"calls": 0, "bootstrap_seconds": 0.0, "codec_seconds": 0.0}
     try:
-        (serve_tcp if args.transport == "tcp" else serve_rdma)(
-            args, link, engine, keys, stats)
+        serve_rdma(args, link, engine, keys, stats)
     except QuotaMet:
         print(f"\nServed {args.expect_bootstraps} bootstraps as requested; exiting.")
     except KeyboardInterrupt:

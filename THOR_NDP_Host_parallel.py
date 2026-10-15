@@ -14,12 +14,22 @@ Keys are shared across streams -- one HE, one set -- because duplicating them
 would give back the VRAM the NDP split saves. Safety comes from the engine lock
 in thor.ndp_parallel; see HENDPParallel for why that costs nothing here.
 
+Two locking modes (see thor.ndp_parallel):
+    default      the engine lock is taken per engine call -- streams interleave
+                 call by call
+    --gpu-token  a stream keeps the lock for its whole GPU phase and hands it
+                 over only while a bootstrap is in flight or its next weights
+                 are being read from disk
+
+Every stage of every layer is timed per stream (StageTimer): one line per stage
+as it finishes, tables at the end, and stage_times.csv in --output-dir.
+
 Sizing for 48 GB VRAM: shared keys are about 14 GiB (rotation + relin + conj +
 fixed rotation keys, no bootstrap key), and each stream adds its own ciphertexts
 plus one stage's weights, roughly 3-4 GiB. Four streams lands near 30 GiB.
 
-    poetry run python THOR_NDP_Host_parallel.py --transport tcp --streams 4
     poetry run python THOR_NDP_Host_parallel.py --transport rdma --streams 4
+    poetry run python THOR_NDP_Host_parallel.py --transport rdma --streams 2 --gpu-token
 """
 
 import os
@@ -42,6 +52,7 @@ from pathlib import Path
 
 from thor.forward import forward_layer, load_encrypted_input
 from thor.ndp_parallel import HENDPParallel, make_parallel_transport
+from thor.stage_timer import StageTimer
 
 
 def parse_args():
@@ -59,10 +70,11 @@ def parse_args():
     p.add_argument("--keys-dir", default=None)
     p.add_argument("--output-dir", default="./ndp_parallel_results")
     p.add_argument("--mode", default="gpu", choices=["gpu", "async gpu"])
-    p.add_argument("--transport", default="tcp", choices=["tcp", "rdma"])
+    p.add_argument("--transport", default="rdma", choices=["rdma"],
+                   help="RDMA is the only transport (the TCP fallback was removed); "
+                        "the flag is kept so scripts passing --transport rdma still work.")
     p.add_argument("--host-ip", default="192.168.100.2")
     p.add_argument("--target-ip", default="192.168.100.1")
-    p.add_argument("--port", type=int, default=9998, help="TCP only.")
     p.add_argument("--nvme-dev", default="nvme1n1", help="RDMA only.")
     p.add_argument("--ib-dev", default="enp216s0np0", help="RDMA only.")
     p.add_argument("--recv-mode", default="pool", choices=["pool", "per-request"],
@@ -76,37 +88,59 @@ def parse_args():
                         "that is N x 294 lines.")
     p.add_argument("--load-bootstrap-key", action="store_true",
                    help="Also load the bootstrap key locally (costs ~17 GiB VRAM).")
+    p.add_argument("--gpu-token", action="store_true",
+                   help="Hold the engine lock for a whole GPU phase instead of per "
+                        "engine call. A stream hands the GPU to another stream only "
+                        "(1) while its offloaded bootstrap is in flight and (2) while "
+                        "its next weights are being read from disk. Default: the "
+                        "original per-call locking, so the two can be A/B compared.")
+    p.add_argument("--prefetch-threads", type=int, default=1,
+                   help="With --gpu-token: threads used to read a stage's weight "
+                        "files into the page cache during the handoff (default 1, "
+                        "the same sequential pattern as the engine's own reads).")
+    p.add_argument("--quiet-stages", action="store_true",
+                   help="Do not print a line per stage as it finishes (the tables "
+                        "at the end and stage_times.csv are still produced).")
     return p.parse_args()
 
 
 def run_stream(stream_id, x, clear_attention_mask, he, results, lock):
-    """One full inference: 12 layers, pooler, classifier."""
+    """One full inference: 12 layers, pooler, classifier.
+
+    he.stream_turn(): with --gpu-token the stream takes the GPU token here and
+    holds it for the whole inference, giving it up only inside bootstraps and
+    weight prefetches (and for good if it fails). Without --gpu-token it does
+    nothing and locking stays per engine call.
+    """
+    timer = he.timer
     t_start = time.perf_counter()
     layer_seconds = []
-    try:
-        for layer_idx in range(12):
+    with he.stream_turn():
+        try:
+            for layer_idx in range(12):
+                t0 = time.perf_counter()
+                with timer.layer(layer_idx):   # prints the layer's breakdown line
+                    x, variables = forward_layer(x, layer_idx, clear_attention_mask, he)
+                layer_seconds.append(round(time.perf_counter() - t0, 3))
+
             t0 = time.perf_counter()
-            x, variables = forward_layer(x, layer_idx, clear_attention_mask, he)
-            layer_seconds.append(round(time.perf_counter() - t0, 3))
-            print(f"  [s{stream_id}] layer {layer_idx} done "
-                  f"({layer_seconds[-1]:.1f}s)", flush=True)
+            with timer.stage(17, "pooler"):
+                x = he.stage_17_pooler(x)
+            with timer.stage(18, "classifier"):
+                x = he.stage_18_classifier(x)
+            head_seconds = time.perf_counter() - t0
 
-        t0 = time.perf_counter()
-        x = he.stage_17_pooler(x)
-        x = he.stage_18_classifier(x)
-        head_seconds = time.perf_counter() - t0
-
-        total = time.perf_counter() - t_start
-        with lock:
-            results[stream_id] = dict(
-                ok=True, total_seconds=round(total, 3),
-                layer_seconds=layer_seconds, head_seconds=round(head_seconds, 3),
-            )
-        print(f"[s{stream_id}] DONE in {total:.1f}s", flush=True)
-    except Exception as exc:
-        with lock:
-            results[stream_id] = dict(ok=False, error=f"{type(exc).__name__}: {exc}")
-        print(f"[s{stream_id}] FAILED: {type(exc).__name__}: {exc}", flush=True)
+            total = time.perf_counter() - t_start
+            with lock:
+                results[stream_id] = dict(
+                    ok=True, total_seconds=round(total, 3),
+                    layer_seconds=layer_seconds, head_seconds=round(head_seconds, 3),
+                )
+            print(f"[s{stream_id}] DONE in {total:.1f}s", flush=True)
+        except Exception as exc:
+            with lock:
+                results[stream_id] = dict(ok=False, error=f"{type(exc).__name__}: {exc}")
+            print(f"[s{stream_id}] FAILED: {type(exc).__name__}: {exc}", flush=True)
 
 
 def main():
@@ -130,10 +164,16 @@ def main():
 
     setup_start = time.perf_counter()
     print(f"Setting up engine and keys (mode={args.mode!r}, reading {keys_dir})")
+    timer = StageTimer(live=not args.quiet_stages)
     he = HENDPParallel(args.device, args.compact, key_size,
                        keys_dir=keys_dir, mode=args.mode, transport=transport,
                        skip_bootstrap_key=not args.load_bootstrap_key,
-                       verbose=args.verbose_bootstrap)
+                       verbose=args.verbose_bootstrap, timer=timer,
+                       gpu_token=args.gpu_token,
+                       prefetch_threads=args.prefetch_threads)
+    lock_desc = ("GPU token (handoff only at bootstraps and weight loading)"
+                 if args.gpu_token else "per engine call")
+    print(f"  engine lock: {lock_desc}")
     print(f"  keys ready ({time.perf_counter() - setup_start:.1f}s, shared by all streams)")
 
     # One encrypted input per stream -- different validation samples, so this is
@@ -196,6 +236,25 @@ def main():
         print(f"  overlap factor     : {bs['bootstrap_seconds'] / wall:.2f}x "
               f"(1.0 = no concurrency, {args.streams}.0 = perfect)")
 
+    # How much each stream lost waiting for the others -- the number that tells
+    # the two lock modes apart.
+    print(f"Waiting for other streams ({bs['lock_mode']} locking):")
+    for name, v in bs["waiting_per_stream"].items():
+        if args.gpu_token:
+            print(f"    {name:4s} {v['handoffs']:4d} handoffs  "
+                  f"token wait after bootstrap {v['token_wait_bootstrap']:8.1f}s  "
+                  f"after weight prefetch {v['token_wait_weights']:7.1f}s  "
+                  f"(longest {v['token_wait_max']:.1f}s)  "
+                  f"prefetched {v['prefetch_gib']:.1f} GiB in "
+                  f"{v['prefetch_seconds']:.1f}s")
+        else:
+            print(f"    {name:4s} engine-lock waits {v['engine_lock_waits']:7d}  "
+                  f"total {v['engine_lock_wait']:8.1f}s")
+
+    timer.report()
+    csv_path = timer.write_csv(output_dir / "stage_times.csv")
+    print(f"Wrote {csv_path}")
+
     (output_dir / "ndp_parallel_result.json").write_text(json.dumps(dict(
         streams=args.streams, dataset_type=args.dataset_type,
         dataset_path=args.dataset_path or None,
@@ -206,6 +265,8 @@ def main():
         completed=len(ok),
         throughput_per_hour=round(len(ok) / wall * 3600, 3) if wall else 0,
         per_stream=results,
+        gpu_token=args.gpu_token, prefetch_threads=args.prefetch_threads,
+        stage_timing=timer.as_dict(),
         **bs,
     ), indent=2) + "\n")
     print(f"Wrote {output_dir / 'ndp_parallel_result.json'}")

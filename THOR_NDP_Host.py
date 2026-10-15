@@ -9,7 +9,6 @@ key is loaded on this side.
 
 Start the target first, then:
 
-    poetry run python THOR_NDP_host.py --transport tcp   --target-ip 192.168.100.1
     poetry run python THOR_NDP_host.py --transport rdma
 """
 
@@ -30,7 +29,7 @@ from pathlib import Path
 
 from thor.forward import forward_layer, load_encrypted_input
 from thor.he_ndp import HENDP, make_transport
-from thor.timer import Timer
+from thor.stage_timer import StageTimer
 
 
 def parse_args():
@@ -47,10 +46,11 @@ def parse_args():
                    help="Host engine mode. Defaults to 'gpu', not 'async gpu': "
                         "Desilo documents async gpu as experimental and advises "
                         "against sharing its data structures with another engine.")
-    p.add_argument("--transport", default="tcp", choices=["tcp", "rdma"])
+    p.add_argument("--transport", default="rdma", choices=["rdma"],
+                   help="RDMA is the only transport (the TCP fallback was removed); "
+                        "the flag is kept so scripts passing --transport rdma still work.")
     p.add_argument("--host-ip", default="192.168.100.2")
     p.add_argument("--target-ip", default="192.168.100.1")
-    p.add_argument("--port", type=int, default=9998, help="TCP transport only.")
     p.add_argument("--nvme-dev", default="nvme1n1", help="RDMA transport only.")
     p.add_argument("--ib-dev", default="enp216s0np0", help="RDMA transport only.")
     p.add_argument("--load-bootstrap-key", action="store_true",
@@ -88,7 +88,10 @@ def main():
     transport = make_transport(args.transport, args)
     print("  connected")
 
-    timer = Timer()
+    # StageTimer: same interface as thor.timer.Timer, but it also records every
+    # stage of every layer (wall time, weight loading, bootstraps) for the
+    # tables printed at the end and the stage_times.csv written next to the JSON.
+    timer = StageTimer()
     started = time.perf_counter()
 
     with timer.setup():
@@ -114,11 +117,9 @@ def main():
     for layer_idx in range(12):
         print(f"Forwarding layer #{layer_idx}")
         t0 = time.perf_counter()
-        with timer.layer(layer_idx):
+        with timer.layer(layer_idx):     # prints the layer's own breakdown line
             x, variables = forward_layer(x, layer_idx, clear_attention_mask, he)
-        elapsed = time.perf_counter() - t0
-        layer_seconds.append(round(elapsed, 3))
-        print(f"  layer #{layer_idx} done ({elapsed:.1f}s)")
+        layer_seconds.append(round(time.perf_counter() - t0, 3))
 
     print("all layers done")
     print("now:", datetime.now())
@@ -152,6 +153,10 @@ def main():
     print(f"  traffic            : {bs['mib_sent']:.0f} MiB out, "
           f"{bs['mib_received']:.0f} MiB back")
 
+    timer.report()
+    csv_path = timer.write_csv(output_dir / "stage_times.csv")
+    print(f"Wrote {csv_path}")
+
     (output_dir / "ndp_host_result.json").write_text(json.dumps(dict(
         dataset_type=args.dataset_type, dataset_path=args.dataset_path or None,
         target_idx=args.target_idx,
@@ -160,6 +165,7 @@ def main():
         total_seconds=round(total, 3), layer_seconds=layer_seconds,
         pooler_seconds=round(pooler_seconds, 3),
         classifier_seconds=round(classifier_seconds, 3),
+        stage_timing=timer.as_dict(),
         **bs,
     ), indent=2) + "\n")
     print(f"Wrote {output_dir / 'ndp_host_result.json'}")

@@ -25,7 +25,6 @@ Sizing for a 128 GB target: each worker holds relinearization + conjugation +
 bootstrap keys, about 17.5 GiB (~12.5 GiB with --compact). Four workers is
 roughly 70 GiB, which leaves headroom. --workers defaults to 4 for that reason.
 
-    poetry run python THOR_NDP_Target_parallel.py --transport tcp --workers 4
     poetry run python THOR_NDP_Target_parallel.py --transport rdma --workers 4 \
         --mode parallel --threads 16
 """
@@ -47,11 +46,10 @@ import json
 import multiprocessing as mp
 import queue
 import socket
-import threading
 import time
 from pathlib import Path
 
-from thor.ndp_parallel import PHEADER, PMAGIC, pframe, punframe, recv_exact
+from thor.ndp_parallel import pframe, punframe
 
 GPU_MODES = ("gpu", "async gpu")
 
@@ -157,12 +155,13 @@ def parse_args():
                         "size this to cores/workers -- one bootstrap stops scaling "
                         "well before it uses a whole large machine.")
     p.add_argument("--device", type=int, default=0, help="CUDA device for GPU modes.")
-    p.add_argument("--transport", default="tcp", choices=["tcp", "rdma"])
-    p.add_argument("--bind", default="0.0.0.0", help="TCP only.")
-    p.add_argument("--port", type=int, default=9998, help="TCP only.")
-    p.add_argument("--target-ip", default="192.168.100.1", help="RDMA only.")
-    p.add_argument("--service", default="9999", help="RDMA only.")
-    p.add_argument("--uds", default="/tmp/rdma_metadata.sock", help="RDMA only.")
+    p.add_argument("--transport", default="rdma", choices=["rdma"],
+                   help="RDMA is the only transport (the TCP fallback was removed); "
+                        "the flag is kept so scripts passing --transport rdma still work.")
+    p.add_argument("--target-ip", default="192.168.100.1")
+    p.add_argument("--service", default="9999", help="RDMA CM service (port).")
+    p.add_argument("--uds", default="/tmp/rdma_metadata.sock",
+                   help="Unix socket the NDP driver writes offload metadata to.")
     p.add_argument("--expect-bootstraps", type=int, default=0, metavar="N",
                    help="Exit automatically once N bootstraps have been served AND "
                         "their replies sent. 0 (the default) keeps the old "
@@ -455,24 +454,14 @@ class Pool:
 # host is refused and dies. So the endpoint is opened up front and the serve
 # loops are handed the open handle.
 #
-# Requests that arrive before the pool is ready are parked, not dropped: TCP
-# payloads sit in the kernel receive buffer, and RDMA doorbells sit in the UDS
-# backlog with the host's buffer still registered (the target initiates the
-# READ, so nothing moves until we move it).
+# Requests that arrive before the pool is ready are parked, not dropped: RDMA
+# doorbells sit in the UDS backlog with the host's buffer still registered (the
+# target initiates the READ, so nothing moves until we move it).
 #
 # Opening before mp.Process.start() is safe because the start method is "spawn":
 # children are fresh interpreters that inherit only the queue pipes, so no
 # child ever sees the CMID or the listening socket.
 def transport_open(args):
-    if args.transport == "tcp":
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind((args.bind, args.port))
-        srv.listen(1)
-        print(f"Listening on tcp://{args.bind}:{args.port} "
-              f"(host may connect now; served once workers are ready)")
-        return {"srv": srv}
-
     import selectors
 
     from pyverbs.cmid import CMID, AddrInfo
@@ -502,77 +491,6 @@ def transport_open(args):
     sel.register(uds, selectors.EVENT_READ)
     print(f"Offload doorbell open at {args.uds}")
     return {"cid": cid, "conn_id": conn_id, "uds": uds, "sel": sel}
-
-
-def serve_tcp(args, link, pool, stats):
-    srv = link["srv"]
-    print(f"Target ready on tcp://{args.bind}:{args.port}")
-
-    while True:
-        conn, peer = srv.accept()
-        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        print(f"Host connected from {peer}")
-        send_lock = threading.Lock()
-        stop = threading.Event()
-        quota = threading.Event()
-
-        def sender():
-            # Replies leave in completion order, not arrival order -- the id in
-            # the frame is what pairs them up on the host.
-            while not stop.is_set():
-                try:
-                    req_id, reply, err = pool.res_q.get(timeout=0.5)
-                except queue.Empty:
-                    continue
-                if err:
-                    print(f"  worker error on req {req_id}: {err}")
-                    continue
-                with send_lock:
-                    try:
-                        conn.sendall(pframe(req_id, reply))
-                    except OSError:
-                        return
-                stats["served"] += 1
-
-                # The quota is reached here, in the sender, but the reader
-                # thread is parked in a blocking recv_exact and will not notice
-                # a flag. Half-closing the read side makes its recv return b""
-                # so recv_exact yields None and the reader falls out of its
-                # loop; quota then tells the outer loop this was deliberate
-                # rather than the host hanging up.
-                if quota_met(args, stats):
-                    quota.set()
-                    stop.set()
-                    try:
-                        conn.shutdown(socket.SHUT_RD)
-                    except OSError:
-                        pass
-                    return
-
-        t = threading.Thread(target=sender, daemon=True)
-        t.start()
-        try:
-            while True:
-                head = recv_exact(conn, PHEADER.size)
-                if head is None:
-                    break
-                magic, req_id, length = PHEADER.unpack(head)
-                if magic != PMAGIC:
-                    raise ValueError(f"bad magic {magic!r} -- parallel host required")
-                payload = recv_exact(conn, length)
-                if payload is None:
-                    break
-                stats["received"] += 1
-                pool.submit(req_id, payload)
-        except Exception as exc:
-            print(f"Connection error: {type(exc).__name__}: {exc}")
-        finally:
-            stop.set()
-            t.join(timeout=2)
-            conn.close()
-        if quota.is_set():
-            raise QuotaMet
-        print("Host disconnected; waiting for the next connection.")
 
 
 def serve_rdma(args, link, pool, stats):
@@ -744,8 +662,7 @@ def main():
 
     stats = {"received": 0, "served": 0}
     try:
-        (serve_tcp if args.transport == "tcp" else serve_rdma)(
-            args, link, pool, stats)
+        serve_rdma(args, link, pool, stats)
     except QuotaMet:
         print(f"\nServed {args.expect_bootstraps} bootstraps as requested; exiting.")
     except KeyboardInterrupt:
