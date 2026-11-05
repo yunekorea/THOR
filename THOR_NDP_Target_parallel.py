@@ -604,7 +604,8 @@ def serve_rdma(args, link, pool, stats):
                 continue
             blob = pframe(req_id, reply)
             out_mr = conn_id.reg_msgs(len(blob))
-            (ctypes.c_uint8 * len(blob)).from_address(out_mr.buf)[:] = blob
+            #(ctypes.c_uint8 * len(blob)).from_address(out_mr.buf)[:] = blob
+            ctypes.memmove(out_mr.buf, blob, len(blob))
             # NOTE: pyverbs signature is post_send(mr, flags, length) -- the
             # second POSITIONAL argument is FLAGS, not length. Passing the size
             # there sets whatever IBV_SEND_* bits happen to be in the number;

@@ -442,7 +442,8 @@ class RdmaMuxTransport(_MuxBase):
 
         with self._cmid_lock:
             mr = self.cmid.reg_read(len(blob))
-            (ctypes.c_uint8 * len(blob)).from_address(mr.buf)[:] = blob
+            #(ctypes.c_uint8 * len(blob)).from_address(mr.buf)[:] = blob
+            ctypes.memmove(mr.buf, blob, len(blob))
             self._ring_doorbell(mr)
         try:
             return self._wait(req_id, event, box)
