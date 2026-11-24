@@ -31,6 +31,13 @@ Usage:
     poetry run python generate_keys.py          # once
     poetry run python THOR_baseline.py
     poetry run python THOR_baseline.py --compact --target-idx 3
+    poetry run python THOR_baseline.py --inferences 4    # serial GPU-only reference
+
+--inferences N runs N inferences one after another in this one process, on
+samples target-idx .. target-idx+N-1, sharing the engine and keys -- the
+GPU-only serial counterpart of THOR_NDP_Host_parallel.py / THOR_Local_Main.py
+with --streams N (same samples, all inputs encrypted during setup, wall time
+measured from the end of setup). With the default N=1 the run is unchanged.
 """
 
 import os, sys
@@ -43,7 +50,9 @@ if project_root not in sys.path:
     sys.path.append(project_root)
 
 import argparse
+import gc
 import json
+import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
@@ -143,12 +152,81 @@ def parse_args():
                         help="Do not print a line per bootstrap call.")
     parser.add_argument("--output-dir", default="./baseline_results")
     parser.add_argument("--print-rotate-levels", action="store_true")
+    parser.add_argument("--inferences", type=int, default=1, metavar="N",
+                        help="Run N inferences one after another (samples "
+                             "target-idx .. target-idx+N-1) with one engine and one "
+                             "key set: the serial GPU-only reference for the "
+                             "N-stream NDP / local runs. Default 1 = unchanged.")
     return parser.parse_args()
+
+
+def gpu_used_mib(device):
+    """Device-wide used VRAM in MiB via nvidia-smi, or None.
+
+    nvidia-smi rather than torch.cuda.mem_get_info: torch is only used on the
+    CPU here, and asking it would create a CUDA context (hundreds of MiB) on a
+    GPU this run already fills with keys.
+    """
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total",
+             "--format=csv,noheader,nounits", "-i", str(device)],
+            capture_output=True, text=True, timeout=10).stdout.strip()
+        used, total = (int(v) for v in out.split(","))
+        return used, total
+    except Exception:
+        return None
+
+
+def run_inference(item, he, timer, bootstrap_timer):
+    """One full inference: 12 layers, pooler, classifier (the original main body).
+
+    The input ciphertext is popped out of `item`, so once layer 0 has replaced
+    `x` nothing references the input any more -- it is freed at the same point
+    as in the original single-run code, not held for the whole inference.
+    """
+    x = item.pop("x")
+    clear_attention_mask = item["mask"]
+    layer_seconds = []
+    for layer_idx in range(12):
+        print(f"Forwarding layer #{layer_idx}")
+        bootstrap_timer.set_layer(layer_idx)
+        t0 = time.perf_counter()
+        with timer.layer(layer_idx):
+            x, variables = forward_layer(x, layer_idx, clear_attention_mask, he)
+        elapsed = time.perf_counter() - t0
+        layer_seconds.append(round(elapsed, 3))
+        print(f"  layer #{layer_idx} done ({elapsed:.1f}s)")
+    del variables
+
+    print("all layers done")
+    print("now:", datetime.now())
+    timer.print_legend()
+
+    # ---- 3. Run pooler and classification -----------------------------------
+    bootstrap_timer.set_layer("head")
+    print("Running pooler")
+    t0 = time.perf_counter()
+    with timer.stage(17, "pooler"):
+        x = he.stage_17_pooler(x)
+    pooler_seconds = time.perf_counter() - t0
+    print(f"  pooler done ({pooler_seconds:.1f}s)")
+
+    print("Running classifier")
+    t0 = time.perf_counter()
+    with timer.stage(18, "classifier"):
+        x = he.stage_18_classifier(x)
+    classifier_seconds = time.perf_counter() - t0
+    print(f"  classifier done ({classifier_seconds:.1f}s)")
+    del x
+    return layer_seconds, pooler_seconds, classifier_seconds
 
 
 def main():
     args = parse_args()
     print(args)
+    if args.inferences < 1:
+        raise SystemExit("--inferences must be at least 1.")
 
     key_size = "medium" if args.compact else "large"
     output_dir = Path(args.output_dir)
@@ -190,44 +268,62 @@ def main():
 
         bootstrap_timer = BootstrapTimer(he, verbose=args.verbose_bootstrap)
 
-        print("Encrypting input")
-        t0 = time.perf_counter()
-        _, x, _, _, clear_attention_mask = load_encrypted_input(
-            args.dataset_type, args.target_idx, he, dataset_path=args.dataset_path
+        # All inputs are encrypted here, inside setup, exactly as the N-stream
+        # NDP / local hosts do before their wall clock starts.
+        inputs = []
+        for i in range(args.inferences):
+            idx = args.target_idx + i
+            print("Encrypting input" + (f" {i} (sample {idx})" if args.inferences > 1 else ""))
+            t0 = time.perf_counter()
+            _, x, _, _, clear_attention_mask = load_encrypted_input(
+                args.dataset_type, idx, he, dataset_path=args.dataset_path
+            )
+            inputs.append(dict(sample=idx, x=x, mask=clear_attention_mask))
+            print(f"  input encrypted ({time.perf_counter() - t0:.1f}s)")
+        del x, clear_attention_mask
+
+    setup_seconds = time.perf_counter() - started
+    vram = gpu_used_mib(args.device)
+    if vram:
+        print(f"  VRAM after setup: {vram[0] / 1024:.1f} of {vram[1] / 1024:.1f} GiB used")
+
+    # ---- 2. Forward 12 attention layers, 3. pooler + classifier ------------
+    run_start = time.perf_counter()
+    per_inference = []
+    for i in range(args.inferences):
+        item, inputs[i] = inputs[i], None      # run_inference pops x out of item
+        idx = item["sample"]
+        if args.inferences > 1:
+            print(f"\n=== Inference {i + 1}/{args.inferences} (sample {idx}) "
+                  f"starting at +{time.perf_counter() - run_start:.1f}s ===")
+        calls0, secs0 = bootstrap_timer.calls, bootstrap_timer.seconds
+        t_begin = time.perf_counter()
+        layer_s, pooler_s, classifier_s = run_inference(item, he, timer, bootstrap_timer)
+        t_end = time.perf_counter()
+        del item
+        gc.collect()
+        vram = gpu_used_mib(args.device)
+        rec = dict(
+            sample=idx,
+            start_offset=round(t_begin - run_start, 3),
+            seconds=round(t_end - t_begin, 3),
+            layer_seconds=layer_s,
+            pooler_seconds=round(pooler_s, 3),
+            classifier_seconds=round(classifier_s, 3),
+            bootstrap_calls=bootstrap_timer.calls - calls0,
+            bootstrap_seconds=round(bootstrap_timer.seconds - secs0, 3),
+            vram_used_mib_after=vram[0] if vram else None,
         )
-        print(f"  input encrypted ({time.perf_counter() - t0:.1f}s)")
+        per_inference.append(rec)
+        if args.inferences > 1:
+            print(f"=== Inference {i + 1}/{args.inferences} done in {rec['seconds']:.1f}s "
+                  f"({rec['bootstrap_calls']} bootstraps, {rec['bootstrap_seconds']:.1f}s"
+                  + (f"; VRAM {vram[0] / 1024:.1f} GiB used" if vram else "") + ") ===")
+    run_seconds = time.perf_counter() - run_start
 
-    # ---- 2. Forward 12 attention layers -------------------------------------
-    layer_seconds = []
-    for layer_idx in range(12):
-        print(f"Forwarding layer #{layer_idx}")
-        bootstrap_timer.set_layer(layer_idx)
-        t0 = time.perf_counter()
-        with timer.layer(layer_idx):
-            x, variables = forward_layer(x, layer_idx, clear_attention_mask, he)
-        elapsed = time.perf_counter() - t0
-        layer_seconds.append(round(elapsed, 3))
-        print(f"  layer #{layer_idx} done ({elapsed:.1f}s)")
-
-    print("all layers done")
-    print("now:", datetime.now())
-    timer.print_legend()
-
-    # ---- 3. Run pooler and classification -----------------------------------
-    bootstrap_timer.set_layer("head")
-    print("Running pooler")
-    t0 = time.perf_counter()
-    with timer.stage(17, "pooler"):
-        x = he.stage_17_pooler(x)
-    pooler_seconds = time.perf_counter() - t0
-    print(f"  pooler done ({pooler_seconds:.1f}s)")
-
-    print("Running classifier")
-    t0 = time.perf_counter()
-    with timer.stage(18, "classifier"):
-        x = he.stage_18_classifier(x)
-    classifier_seconds = time.perf_counter() - t0
-    print(f"  classifier done ({classifier_seconds:.1f}s)")
+    layer_seconds = [s for r in per_inference for s in r["layer_seconds"]]
+    pooler_seconds = sum(r["pooler_seconds"] for r in per_inference)
+    classifier_seconds = sum(r["classifier_seconds"] for r in per_inference)
 
     total = time.perf_counter() - started
     print("now:", datetime.now())
@@ -248,6 +344,24 @@ def main():
     if total:
         print(f"  share of wall time : {100 * bs['bootstrap_seconds'] / total:.1f}%")
 
+    # Comparable to the "Wall time for N inferences" of the N-stream hosts:
+    # measured from the end of setup, so key loading is not in it.
+    n = args.inferences
+    print(f"Wall time for {n} inference(s), after setup: {run_seconds:.1f}s "
+          f"(setup {setup_seconds:.1f}s)")
+    if n > 1:
+        lat = [r["seconds"] for r in per_inference]
+        print(f"  per-inference      : min {min(lat):.1f}s  max {max(lat):.1f}s  "
+              f"mean {sum(lat) / n:.1f}s")
+        for k, r in enumerate(per_inference):
+            print(f"    #{k} sample {r['sample']:3d}  {r['seconds']:8.1f}s  "
+                  f"bootstraps {r['bootstrap_seconds']:7.1f}s  "
+                  f"other {r['seconds'] - r['bootstrap_seconds']:7.1f}s"
+                  + (f"  VRAM after {r['vram_used_mib_after'] / 1024:.1f} GiB"
+                     if r['vram_used_mib_after'] is not None else ""))
+    if run_seconds:
+        print(f"  THROUGHPUT         : {n / run_seconds * 3600:.2f} inferences/hour")
+
     (output_dir / "baseline_result.json").write_text(json.dumps(dict(
         dataset_type=args.dataset_type,
         dataset_path=args.dataset_path or None,
@@ -259,9 +373,16 @@ def main():
         use_rotation_key=args.use_rotation_key,
         keys_dir=str(keys_dir) if keys_dir else None,
         total_seconds=round(total, 3),
+        # With --inferences N > 1: layer_seconds is all N x 12 layers in run
+        # order, pooler/classifier are summed; per_inference has the split.
         layer_seconds=layer_seconds,
         pooler_seconds=round(pooler_seconds, 3),
         classifier_seconds=round(classifier_seconds, 3),
+        inferences=n,
+        setup_seconds=round(setup_seconds, 3),
+        wall_seconds=round(run_seconds, 3),
+        throughput_per_hour=round(n / run_seconds * 3600, 3) if run_seconds else 0,
+        per_inference=per_inference,
         **bs,
     ), indent=2) + "\n")
     print(f"Wrote {output_dir / 'baseline_result.json'}")

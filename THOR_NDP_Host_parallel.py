@@ -30,6 +30,19 @@ plus one stage's weights, roughly 3-4 GiB. Four streams lands near 30 GiB.
 
     poetry run python THOR_NDP_Host_parallel.py --transport rdma --streams 4
     poetry run python THOR_NDP_Host_parallel.py --transport rdma --streams 2 --gpu-token
+    poetry run python THOR_NDP_Host_parallel.py --transport rdma --streams 4 --gpu-token --stagger 3
+
+--stagger S starts stream i at +i*S seconds instead of all at once, so the
+streams' bootstraps do not line up and leave the GPU with nothing to do.
+
+GPU idle time is reported for every run, two ways:
+  token idle   (--gpu-token only) exact: time during which no stream holds the
+               GPU token, i.e. every stream that has started is waiting on a
+               bootstrap or reading weights. Split into ramp (streams still
+               starting / already finishing) and steady state (all running).
+  nvidia-smi   hardware view, sampled every --gpu-sample-ms: mean utilization,
+               idle estimated as sum(1 - util) * interval, and peak VRAM.
+Both timelines are written to --output-dir for plotting.
 """
 
 import os
@@ -45,6 +58,7 @@ if project_root not in sys.path:
 
 import argparse
 import json
+import subprocess
 import threading
 import time
 from datetime import datetime
@@ -101,10 +115,156 @@ def parse_args():
     p.add_argument("--quiet-stages", action="store_true",
                    help="Do not print a line per stage as it finishes (the tables "
                         "at the end and stage_times.csv are still produced).")
+    p.add_argument("--stagger", type=float, default=0.0, metavar="SECONDS",
+                   help="Start stream i at +i*SECONDS instead of all at once "
+                        "(e.g. 3 -> streams start at +0, +3, +6, +9 s). The wall "
+                        "time still runs from the first stream's start, so the "
+                        "delay is counted against throughput. Default 0.")
+    p.add_argument("--gpu-sample-ms", type=int, default=1000, metavar="MS",
+                   help="nvidia-smi sampling interval for GPU utilization / VRAM "
+                        "during the run (0 disables it). Default 1000.")
     return p.parse_args()
 
 
-def run_stream(stream_id, x, clear_attention_mask, he, results, lock):
+# ======================================================================
+# GPU idle measurement
+# ======================================================================
+class TokenIdleTracker:
+    """Exact busy/idle timeline of the --gpu-token GpuLock.
+
+    The GPU has work exactly while some stream owns the token: a stream gives
+    it up only while its bootstrap is in flight or its weights are being read,
+    and takes it back before touching the engine again. So "no owner" is the
+    application-level definition of an idle GPU.
+
+    Every write to the lock's _owner (in _take, acquire, release, yielded) is
+    caught by swapping the lock's class for a subclass where _owner is a
+    property -- thor.ndp_parallel itself is not modified.
+    """
+
+    def __init__(self, lock):
+        self.events = []                     # (perf_counter, busy)
+        tracker = self
+        base = type(lock)
+
+        class TrackedGpuLock(base):
+            @property
+            def _owner(self):
+                return self.__dict__.get("_tracked_owner")
+
+            @_owner.setter
+            def _owner(self, value):
+                old = self.__dict__.get("_tracked_owner")
+                self.__dict__["_tracked_owner"] = value
+                if (old is None) != (value is None):
+                    tracker.events.append((time.perf_counter(), value is not None))
+
+        current = lock.__dict__.pop("_owner", None)
+        lock.__class__ = TrackedGpuLock
+        lock.__dict__["_tracked_owner"] = current
+
+    def idle(self, t0, t1, min_gap=0.01):
+        """Idle seconds in [t0, t1], number of gaps >= min_gap, longest gap."""
+        if t1 <= t0:
+            return dict(seconds=0.0, window=0.0, fraction=0.0, gaps=0, longest=0.0)
+        busy = False
+        for t, b in self.events:              # state at t0
+            if t > t0:
+                break
+            busy = b
+        idle_total, gaps, longest = 0.0, 0, 0.0
+        cur = t0
+        for t, b in self.events:
+            if t <= t0:
+                continue
+            if t >= t1:
+                break
+            if not busy and b:                # an idle stretch ends at t
+                gap = t - cur
+                idle_total += gap
+                if gap >= min_gap:
+                    gaps += 1
+                longest = max(longest, gap)
+            if b != busy:
+                busy, cur = b, t
+        if not busy:
+            gap = t1 - cur
+            idle_total += gap
+            if gap >= min_gap:
+                gaps += 1
+            longest = max(longest, gap)
+        w = t1 - t0
+        return dict(seconds=round(idle_total, 3), window=round(w, 3),
+                    fraction=round(idle_total / w, 4), gaps=gaps,
+                    longest=round(longest, 3))
+
+    def write_csv(self, path, t_ref):
+        with open(path, "w") as f:
+            f.write("t_seconds,busy\n")
+            for t, b in self.events:
+                if t >= t_ref:
+                    f.write(f"{t - t_ref:.4f},{int(b)}\n")
+        return path
+
+
+class SmiSampler:
+    """nvidia-smi utilization / VRAM samples, timestamped on this clock."""
+
+    def __init__(self, device, interval_ms):
+        self.interval = interval_ms / 1000.0
+        self.samples = []                     # (perf_counter, util %, MiB used)
+        self.proc = None
+        if interval_ms <= 0:
+            return
+        try:
+            self.proc = subprocess.Popen(
+                ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used",
+                 "--format=csv,noheader,nounits", "-i", str(device),
+                 "-lms", str(interval_ms)],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        except (FileNotFoundError, OSError) as exc:
+            print(f"  (nvidia-smi sampling disabled: {exc})")
+            return
+        threading.Thread(target=self._read, daemon=True, name="smi").start()
+
+    def _read(self):
+        for line in self.proc.stdout:
+            try:
+                util, mem = (int(v) for v in line.strip().split(","))
+            except ValueError:
+                continue
+            self.samples.append((time.perf_counter(), util, mem))
+
+    def stop(self):
+        if self.proc is not None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+
+    def summary(self, t0, t1):
+        s = [x for x in self.samples if t0 <= x[0] <= t1]
+        if not s:
+            return None
+        utils = [u for _, u, _ in s]
+        return dict(samples=len(s),
+                    mean_util_percent=round(sum(utils) / len(utils), 1),
+                    idle_seconds_est=round(sum(100 - u for u in utils) / 100 * self.interval, 1),
+                    idle_fraction_est=round(sum(100 - u for u in utils) / 100 / len(utils), 4),
+                    zero_util_samples=sum(1 for u in utils if u == 0),
+                    peak_vram_mib=max(m for _, _, m in s),
+                    mean_vram_mib=round(sum(m for _, _, m in s) / len(s)))
+
+    def write_csv(self, path, t_ref):
+        with open(path, "w") as f:
+            f.write("t_seconds,util_percent,vram_mib\n")
+            for t, u, m in self.samples:
+                f.write(f"{t - t_ref:.3f},{u},{m}\n")
+        return path
+
+
+def run_stream(stream_id, x, clear_attention_mask, he, results, lock, run_start):
     """One full inference: 12 layers, pooler, classifier.
 
     he.stream_turn(): with --gpu-token the stream takes the GPU token here and
@@ -130,10 +290,13 @@ def run_stream(stream_id, x, clear_attention_mask, he, results, lock):
                 x = he.stage_18_classifier(x)
             head_seconds = time.perf_counter() - t0
 
-            total = time.perf_counter() - t_start
+            t_end = time.perf_counter()
+            total = t_end - t_start
             with lock:
                 results[stream_id] = dict(
                     ok=True, total_seconds=round(total, 3),
+                    start_offset=round(t_start - run_start, 3),
+                    end_offset=round(t_end - run_start, 3),
                     layer_seconds=layer_seconds, head_seconds=round(head_seconds, 3),
                 )
             print(f"[s{stream_id}] DONE in {total:.1f}s", flush=True)
@@ -188,23 +351,36 @@ def main():
         print(f"  stream {s}: sample {idx} encrypted ({time.perf_counter() - t0:.1f}s)")
     setup_seconds = time.perf_counter() - setup_start
 
+    token_tracker = TokenIdleTracker(he.lock) if args.gpu_token else None
+    smi = SmiSampler(args.device, args.gpu_sample_ms)
+
     results, lock = {}, threading.Lock()
-    print(f"\nStarting {args.streams} concurrent inferences at {datetime.now()}")
+    stagger_desc = f", staggered by {args.stagger:g}s" if args.stagger > 0 else ""
+    print(f"\nStarting {args.streams} concurrent inferences{stagger_desc} at {datetime.now()}")
     run_start = time.perf_counter()
 
     # thread name is what HENDPParallel.bootstrap tags its per-call lines with
     threads = [
         threading.Thread(target=run_stream,
-                         args=(s, inputs[s][0], inputs[s][1], he, results, lock),
+                         args=(s, inputs[s][0], inputs[s][1], he, results, lock,
+                               run_start),
                          name=f"s{s}")
         for s in range(args.streams)
     ]
-    for t in threads:
+    for s, t in enumerate(threads):
+        if s and args.stagger > 0:
+            delay = run_start + s * args.stagger - time.perf_counter()
+            if delay > 0:
+                time.sleep(delay)
+        if args.stagger > 0:
+            print(f"[s{s}] starting at +{time.perf_counter() - run_start:.1f}s", flush=True)
         t.start()
     for t in threads:
         t.join()
 
-    wall = time.perf_counter() - run_start
+    run_end = time.perf_counter()
+    wall = run_end - run_start
+    smi.stop()
     ok = [r for r in results.values() if r.get("ok")]
     bs = he.report()
 
@@ -251,6 +427,48 @@ def main():
             print(f"    {name:4s} engine-lock waits {v['engine_lock_waits']:7d}  "
                   f"total {v['engine_lock_wait']:8.1f}s")
 
+    # ---- GPU idle --------------------------------------------------------
+    gpu_idle = dict(stagger_seconds=args.stagger)
+    starts = [r["start_offset"] for r in ok]
+    ends = [r["end_offset"] for r in ok]
+    print(f"GPU idle (stagger {args.stagger:g}s):")
+    if token_tracker is not None:
+        full = token_tracker.idle(run_start, run_end)
+        gpu_idle["token_full"] = full
+        print(f"  token idle (no stream holds the GPU): {full['seconds']:.1f}s of "
+              f"{full['window']:.1f}s wall ({100 * full['fraction']:.1f}%), "
+              f"{full['gaps']} gaps >= 10 ms, longest {full['longest']:.1f}s")
+        if len(ok) == args.streams and args.streams > 1:
+            s0, s1 = run_start + max(starts), run_start + min(ends)
+            steady = token_tracker.idle(s0, s1)
+            gpu_idle["token_steady"] = dict(steady, start_offset=round(max(starts), 3),
+                                            end_offset=round(min(ends), 3))
+            ramp = round(full["seconds"] - steady["seconds"], 3)
+            ramp_w = round(full["window"] - steady["window"], 3)
+            gpu_idle["token_ramp"] = dict(seconds=ramp, window=ramp_w)
+            print(f"    steady state (all {args.streams} running, "
+                  f"+{max(starts):.0f}s .. +{min(ends):.0f}s): {steady['seconds']:.1f}s of "
+                  f"{steady['window']:.1f}s ({100 * steady['fraction']:.1f}%), "
+                  f"longest gap {steady['longest']:.1f}s")
+            print(f"    ramp-up + ramp-down             : {ramp:.1f}s of {ramp_w:.1f}s")
+        tl = token_tracker.write_csv(output_dir / "gpu_token_timeline.csv", run_start)
+        print(f"  token timeline: {tl}")
+    else:
+        print("  token idle: needs --gpu-token (without it the lock is taken per "
+              "engine call and does not mark GPU phases)")
+    sm = smi.summary(run_start, run_end)
+    if sm:
+        gpu_idle["nvidia_smi"] = sm
+        print(f"  nvidia-smi: mean util {sm['mean_util_percent']:.1f}%, est. idle "
+              f"{sm['idle_seconds_est']:.0f}s ({100 * sm['idle_fraction_est']:.1f}%), "
+              f"0%-util samples {sm['zero_util_samples']}/{sm['samples']}, "
+              f"peak VRAM {sm['peak_vram_mib'] / 1024:.1f} GiB "
+              f"(mean {sm['mean_vram_mib'] / 1024:.1f} GiB)")
+        sp = smi.write_csv(output_dir / "gpu_smi_samples.csv", run_start)
+        print(f"  nvidia-smi samples: {sp}")
+    elif args.gpu_sample_ms > 0:
+        print("  nvidia-smi: no samples")
+
     timer.report()
     csv_path = timer.write_csv(output_dir / "stage_times.csv")
     print(f"Wrote {csv_path}")
@@ -266,6 +484,8 @@ def main():
         throughput_per_hour=round(len(ok) / wall * 3600, 3) if wall else 0,
         per_stream=results,
         gpu_token=args.gpu_token, prefetch_threads=args.prefetch_threads,
+        stagger_seconds=args.stagger,
+        gpu_idle=gpu_idle,
         stage_timing=timer.as_dict(),
         **bs,
     ), indent=2) + "\n")
